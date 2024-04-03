@@ -2,6 +2,6 @@
 
 #include "perform_etl.hh"
 
-PYBIND11_MODULE(meds_etl_native, m) {
+PYBIND11_MODULE(meds_etl_cpp, m) {
     m.def("perform_etl", perform_etl);
 }

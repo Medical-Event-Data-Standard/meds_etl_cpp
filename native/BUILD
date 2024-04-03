@@ -31,9 +31,9 @@ cc_binary(
 )
 
 pybind_extension(
-    name="meds_etl_native",
+    name="meds_etl_cpp",
     srcs=[
-        "meds_etl_native.cc",
+        "meds_etl_cpp.cc",
     ],
     deps=[":perform_etl"],
 )
