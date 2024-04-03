@@ -20,14 +20,14 @@ jobs:
 
     - name: Build wheels linux
       uses: pypa/cibuildwheel@v2.12.2
-      if: matrix.version == 'cpu' && matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'ubuntu-latest'
       env:
         CIBW_ARCHS_LINUX: x86_64
         CIBW_SKIP: '*-musllinux_*'
 
     - name: Build wheels mac
       uses: pypa/cibuildwheel@v2.12.2
-      if: matrix.version == 'cpu' && matrix.os == 'macos-12'
+      if: matrix.os == 'macos-12'
       env:
         CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=10.14
         CIBW_ARCHS_MACOS: x86_64 arm64
@@ -48,20 +48,6 @@ jobs:
     - uses: actions/upload-artifact@v3
       with:
         path: dist/*.tar.gz
-
-  upload_all:
-    needs: [build_wheels, make_sdist]
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/download-artifact@v3
-      with:
-        name: artifact
-        path: dist
-
-    - uses: pypa/gh-action-pypi-publish@v1.5.0
-      with:
-        user: __token__
-        password: ${{ secrets.pypi_token }}
   
   publish-to-pypi:
     name: >-
