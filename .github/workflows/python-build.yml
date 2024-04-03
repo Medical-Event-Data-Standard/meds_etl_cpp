@@ -22,6 +22,7 @@ jobs:
       uses: pypa/cibuildwheel@v2.12.2
       if: matrix.os == 'ubuntu-latest'
       env:
+        CIBW_BEFORE_ALL_LINUX: bash build/linux_setup.sh
         CIBW_ARCHS_LINUX: x86_64
         CIBW_SKIP: '*-musllinux_*'
 
