@@ -107,7 +107,7 @@ class cmake_build_ext(build_ext):
 
 setuptools.setup(
     ext_modules=[
-        BazelExtension("meds_etl_native", "meds_etl_native.so", "native"),
+        BazelExtension("meds_etl_cpp", "meds_etl_cpp.so", "native"),
     ],
     cmdclass={"build_ext": cmake_build_ext},
     zip_safe=False,
