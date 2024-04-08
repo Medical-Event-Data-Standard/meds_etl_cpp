@@ -60,9 +60,6 @@ class cmake_build_ext(build_ext):
             if source_env.get("DISTDIR"):
                 extra_args.extend(["--distdir", source_env["DISTDIR"]])
 
-            if has_nvcc():
-                extra_args.extend(["--//:cuda=enabled"])
-
             if source_env.get("MACOSX_DEPLOYMENT_TARGET"):
                 extra_args.extend(["--macos_minimum_os", source_env["MACOSX_DEPLOYMENT_TARGET"]])
 

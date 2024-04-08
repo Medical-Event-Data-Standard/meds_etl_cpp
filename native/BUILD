@@ -18,7 +18,7 @@ cc_library(
         "@com_google_absl//absl/types:optional",
         "@readerwriterqueue",
         "@concurrentqueue",
-        "@snappy",
+        ":zstd",
     ],
 )
 
@@ -55,8 +55,6 @@ cmake(
         "EP_COMMON_CMAKE_ARGS": "-DWITH_OPENSSL=OFF",
         "ARROW_DEPENDENCY_SOURCE": "BUNDLED",
     },
-    deps = [
-    ],
     tags = ["requires-network"],
     generate_args = ["-DCMAKE_RANLIB=/usr/bin/ranlib"],
     working_directory="cpp",
@@ -64,5 +62,16 @@ cmake(
     out_lib_dir = "lib64",
     out_static_libs = ["libparquet.a", "libarrow.a", "libarrow_bundled_dependencies.a"],
     linkopts = ["-pthread"],
+)
 
+cmake(
+    name = "zstd",
+    cache_entries = {
+        "CMAKE_C_FLAGS": "-fPIC",
+        "CMAKE_CXX_FLAGS": "-fPIC",
+    },
+    working_directory="build/cmake",
+    lib_source = "@zstd//:all",
+    out_lib_dir = "lib64",
+    out_static_libs = ["libzstd.a"],
 )

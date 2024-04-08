@@ -8,13 +8,6 @@ http_archive(
   sha256 = "efa465b26da194f82320b4e39e2ca637ebe3129d7f3732ee71d9942099e3c773",
 )
 
-http_archive(
-  name = "snappy",
-  urls = ["https://github.com/google/snappy/archive/27f34a580be4a3becf5f8c0cba13433f53c21337.zip"],
-  strip_prefix = "snappy-27f34a580be4a3becf5f8c0cba13433f53c21337",
-  sha256 = "6c18c64264a2b15531896824b85c47e85da3e42059631661fbe0c588e4e3aa99",
-)
-
 new_git_repository(
     name = "concurrentqueue",
     remote = "https://github.com/cameron314/concurrentqueue.git",
@@ -89,4 +82,11 @@ http_archive(
     build_file_content = all_content,
     sha256 = "c0ebc13e9bc428c0c9f617444dcd161140e2bf9a7c65c5ae6bf239e5567175fd",
     patches = ["//patches:ThirdpartyToolchain.cmake.patch"],
+)
+
+http_archive(
+    name="zstd",
+    strip_prefix="zstd-1.5.6",
+    urls = ["https://github.com/facebook/zstd/archive/refs/tags/v1.5.6.zip"],
+    build_file_content = all_content,
 )
