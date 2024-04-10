@@ -11,7 +11,7 @@ cc_binary(
 
 cc_library(
     name="perform_etl",
-    srcs=["perform_etl.cc"],
+    srcs=["perform_etl.cc", "pdqsort.h"],
     hdrs=["perform_etl.hh"],
     deps=[
         ":arrow", 

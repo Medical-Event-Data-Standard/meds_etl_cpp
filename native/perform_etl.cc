@@ -25,18 +25,37 @@
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
 #include "parquet/arrow/writer.h"
+#include "pdqsort.h"
 #include "zstd.h"
 
 namespace fs = std::filesystem;
 
-const size_t SHARD_PIECE_SIZE = 2 * 1000 * 1000 * 1000;  // Roughly 2 gigabytes
-const size_t COMPRESSION_BUFFER_SIZE = 4 * 1000 * 1000;  // Roughly 4 megabytes
+const size_t SHARD_PIECE_SIZE =
+    ((size_t)4 * 1000) * 1000 * 1000;  // Roughly 4 gigabytes
+const size_t PARQUET_PIECE_SIZE =
+    ((size_t)100) * 1000 * 1000;  // Roughly 100 megabytes
+const size_t COMPRESSION_BUFFER_SIZE = 1 * 1000 * 1000;  // Roughly 1 megabytes
+
+template <typename T, bool reversed = false>
+struct EventComparator {
+    bool operator()(const T& a, const T& b) const {
+        if (reversed) {
+            return (std::get<0>(a) > std::get<0>(b)) |
+                   ((std::get<0>(a) == std::get<0>(b)) &
+                    (std::get<1>(a) > std::get<1>(b)));
+        } else {
+            return (std::get<0>(a) < std::get<0>(b)) |
+                   ((std::get<0>(a) == std::get<0>(b)) &
+                    (std::get<1>(a) < std::get<1>(b)));
+        }
+    }
+};
 
 std::vector<std::shared_ptr<::arrow::Field>> get_fields_for_file(
     arrow::MemoryPool* pool, const std::string& filename) {
     // Configure general Parquet reader settings
     auto reader_properties = parquet::ReaderProperties(pool);
-    reader_properties.set_buffer_size(4096 * 4);
+    reader_properties.set_buffer_size(1024 * 1024);
     reader_properties.enable_buffered_stream();
 
     // Configure Arrow-specific Parquet reader settings
@@ -133,34 +152,6 @@ get_metadata_fields_multithreaded(const std::vector<std::string>& files,
     return result;
 }
 
-/*
-struct Row {
-    int64_t patient_id;
-
-    int64_t time; // Actually an Arrow Timestamp with microsecond precision
-
-    std::string code;
-
-    absl::optional<float> numeric_value;
-    absl::optional<int64_t> datetime_value; // Actually an Arrow Timestamp with
-microsecond precision absl::optional<std::string> text_value;
-
-    std::vector<absl::optional<std::string>> metadata_columns;
-};
-
-struct Row {
-    int64_t patient_id;
-    int64_t time;
-
-    std::vector<char> data;
-
-    bool operator<(const Row& rhs) {
-        return std::make_pair(patient_id, time) <
-               std::make_pair(rhs.patient_id, rhs.time);
-    }
-};
-*/
-
 template <typename T>
 void add_literal_to_vector(std::vector<char>& data, T to_add) {
     const char* bytes = reinterpret_cast<const char*>(&to_add);
@@ -205,7 +196,7 @@ void shard_reader(
 
             // Configure general Parquet reader settings
             auto reader_properties = parquet::ReaderProperties(pool);
-            reader_properties.set_buffer_size(4096 * 4);
+            reader_properties.set_buffer_size(1024 * 1024);
             reader_properties.enable_buffered_stream();
 
             // Configure Arrow-specific Parquet reader settings
@@ -836,7 +827,9 @@ void shard_sort(
             }
         }
 
-        std::sort(std::begin(row_indices), std::end(row_indices));
+        pdqsort_branchless(
+            std::begin(row_indices), std::end(row_indices),
+            EventComparator<decltype(row_indices)::value_type>());
 
         {
             ZstdRowWriter writer(filename, compression_context.get());
@@ -934,9 +927,11 @@ sort_and_shard(const std::filesystem::path& source_directory,
                          remaining_live_writers);
         });
 
-        threads.emplace_back([&sort_queue, &remaining_live_writers]() {
-            shard_sort(sort_queue, remaining_live_writers);
-        });
+        if (i % 2 == 0) {
+            threads.emplace_back([&sort_queue, &remaining_live_writers]() {
+                shard_sort(sort_queue, remaining_live_writers);
+            });
+        }
     }
 
     for (auto& thread : threads) {
@@ -1050,7 +1045,7 @@ void join_and_write_single(
         PriorityQueueItem;
 
     std::priority_queue<PriorityQueueItem, std::vector<PriorityQueueItem>,
-                        std::greater<PriorityQueueItem>>
+                        EventComparator<PriorityQueueItem, true>>
         queue;
 
     for (size_t i = 0; i < source_files.size(); i++) {
@@ -1151,7 +1146,7 @@ void join_and_write_single(
         if (patient_id != last_patient_id || is_first) {
             is_first = false;
 
-            if (amount_written > SHARD_PIECE_SIZE) {
+            if (amount_written > PARQUET_PIECE_SIZE) {
                 flush_arrays();
             }
 
