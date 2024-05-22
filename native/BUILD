@@ -61,6 +61,7 @@ cmake(
     working_directory="cpp",
     lib_source = "@arrow//:all",
     out_static_libs = ["libparquet.a", "libarrow.a", "libarrow_bundled_dependencies.a"],
+    out_lib_dir = "lib64",
     linkopts = ["-pthread"],
 )
 
@@ -70,6 +71,7 @@ cmake(
         "CMAKE_C_FLAGS": "-fPIC",
         "CMAKE_CXX_FLAGS": "-fPIC",
     },
+    out_lib_dir = "lib64",
     working_directory="build/cmake",
     lib_source = "@zstd//:all",
     out_static_libs = ["libzstd.a"],
