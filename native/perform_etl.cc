@@ -89,9 +89,10 @@ std::vector<std::shared_ptr<::arrow::Field>> get_fields_for_file(
     return fields;
 }
 
-const std::vector<std::string> known_fields = {
-    "patient_id",    "time",           "code",
-    "numeric_value", "datetime_value", "text_value"};
+const std::vector<std::string> known_fields = {"patient_id", "time"};
+
+const std::vector<std::string> main_fields = {"code", "numeric_value",
+                                              "datetime_value", "text_value"};
 
 std::set<std::pair<std::string, std::shared_ptr<arrow::DataType>>>
 get_metadata_fields(const std::vector<std::string>& files) {
@@ -214,11 +215,6 @@ void shard_reader(
 
             int patient_id_index = -1;
             int time_index = -1;
-            int code_index = -1;
-
-            int numeric_value_index = -1;
-            int datetime_value_index = -1;
-            int text_value_index = -1;
 
             std::vector<int> metadata_indices(metadata_columns.size(), -1);
 
@@ -253,43 +249,6 @@ void shard_reader(
                             schema_field.field->ToString());
                     }
                     time_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "code") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::LargeStringType())) {
-                        throw std::runtime_error(
-                            "The C++ MEDS-Flat ETL requires large_string codes "
-                            "but found " +
-                            schema_field.field->ToString());
-                    }
-
-                    code_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "numeric_value") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::FloatType())) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires Float numeric_value but "
-                            "found " +
-                            schema_field.field->ToString());
-                    }
-                    numeric_value_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "datetime_value") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::TimestampType(arrow::TimeUnit::MICRO))) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires microsecond timestamp "
-                            "datetime_value but found " +
-                            schema_field.field->ToString());
-                    }
-                    datetime_value_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "text_value") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::LargeStringType())) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires Float32 numeric_value but "
-                            "found " +
-                            schema_field.field->ToString());
-                    }
-                    text_value_index = schema_field.column_index;
                 } else {
                     // Must be metadata
                     auto iter = std::find_if(
@@ -313,19 +272,6 @@ void shard_reader(
 
                     int offset = (iter - std::begin(metadata_columns));
 
-                    if (iter->second->Equals(arrow::LargeStringType())) {
-                        is_text_metadata[offset] = true;
-                    } else {
-                        is_text_metadata[offset] = false;
-
-                        if (iter->second->byte_width() == -1) {
-                            throw std::runtime_error(
-                                "Found non text metadata with unknown byte "
-                                "width? " +
-                                iter->second->ToString());
-                        }
-                    }
-
                     metadata_indices[offset] = schema_field.column_index;
                 }
             }
@@ -337,10 +283,6 @@ void shard_reader(
 
             if (time_index == -1) {
                 throw std::runtime_error("Could not find time column index");
-            }
-
-            if (code_index == -1) {
-                throw std::runtime_error("Could not find code column index");
             }
 
             std::shared_ptr<::arrow::RecordBatchReader> rb_reader;
@@ -370,58 +312,39 @@ void shard_reader(
                     throw std::runtime_error("Could not cast time array");
                 }
 
-                auto code_array =
-                    std::dynamic_pointer_cast<arrow::LargeStringArray>(
-                        record_batch->column(code_index));
-                if (!code_array) {
-                    throw std::runtime_error("Could not cast code array");
-                }
-
-                auto numeric_value_array = std::dynamic_pointer_cast<
-                    arrow::NumericArray<arrow::FloatType>>(
-                    record_batch->column(numeric_value_index));
-                if (!numeric_value_array) {
-                    throw std::runtime_error(
-                        "Could not cast numeric_value array");
-                }
-
-                auto datetime_value_array = std::dynamic_pointer_cast<
-                    arrow::NumericArray<arrow::TimestampType>>(
-                    record_batch->column(datetime_value_index));
-                if (!datetime_value_array) {
-                    throw std::runtime_error(
-                        "Could not cast datetime_value array");
-                }
-
-                auto text_value_array =
-                    std::dynamic_pointer_cast<arrow::LargeStringArray>(
-                        record_batch->column(text_value_index));
-                if (!text_value_array) {
-                    throw std::runtime_error("Could not cast text_value array");
-                }
-
+                std::vector<std::shared_ptr<arrow::StringArray>>
+                    text_metadata_arrays(record_batch->num_columns());
                 std::vector<std::shared_ptr<arrow::LargeStringArray>>
-                    text_metadata_arrays(metadata_columns.size());
+                    large_text_metadata_arrays(record_batch->num_columns());
                 std::vector<std::shared_ptr<arrow::FixedSizeBinaryArray>>
-                    primitive_metadata_arrays(metadata_columns.size());
+                    primitive_metadata_arrays(record_batch->num_columns());
 
                 for (size_t i = 0; i < metadata_columns.size(); i++) {
                     if (metadata_indices[i] == -1) {
                         continue;
                     }
 
-                    if (is_text_metadata[i]) {
+                    {
                         auto metadata_array =
                             std::dynamic_pointer_cast<arrow::LargeStringArray>(
                                 record_batch->column(metadata_indices[i]));
-                        if (!metadata_array) {
-                            throw std::runtime_error(
-                                "Could not cast metadata array to text" +
-                                metadata_columns[i].first + " " +
-                                metadata_columns[i].second->ToString());
+                        if (metadata_array) {
+                            large_text_metadata_arrays[i] = metadata_array;
+                            continue;
                         }
-                        text_metadata_arrays[i] = metadata_array;
-                    } else {
+                    }
+
+                    {
+                        auto metadata_array =
+                            std::dynamic_pointer_cast<arrow::StringArray>(
+                                record_batch->column(metadata_indices[i]));
+                        if (metadata_array) {
+                            text_metadata_arrays[i] = metadata_array;
+                            continue;
+                        }
+                    }
+
+                    {
                         std::shared_ptr<arrow::Array> fixed_size_array;
                         PARQUET_ASSIGN_OR_THROW(
                             fixed_size_array,
@@ -432,17 +355,19 @@ void shard_reader(
 
                         auto metadata_array = std::dynamic_pointer_cast<
                             arrow::FixedSizeBinaryArray>(fixed_size_array);
-                        if (!metadata_array) {
-                            throw std::runtime_error(
-                                "Could not cast metadata array to fixed size " +
-                                metadata_columns[i].first + " " +
-                                metadata_columns[i].second->ToString());
+                        if (metadata_array) {
+                            primitive_metadata_arrays[i] = metadata_array;
+                            continue;
                         }
-                        primitive_metadata_arrays[i] = metadata_array;
                     }
+
+                    throw std::runtime_error(
+                        "Could not cast metadata field " +
+                        metadata_columns[i].first + " " +
+                        metadata_columns[i].second->ToString());
                 }
 
-                for (int64_t i = 0; i < text_value_array->length(); i++) {
+                for (int64_t i = 0; i < patient_id_array->length(); i++) {
                     if (!patient_id_array->IsValid(i)) {
                         throw std::runtime_error(
                             "patient_id incorrectly has null value " + source);
@@ -450,10 +375,6 @@ void shard_reader(
                     if (!time_array->IsValid(i)) {
                         throw std::runtime_error(
                             "time incorrectly has null value " + source);
-                    }
-                    if (!code_array->IsValid(i)) {
-                        throw std::runtime_error(
-                            "code incorrectly has null value " + source);
                     }
 
                     std::vector<char> data;
@@ -467,37 +388,23 @@ void shard_reader(
                     add_literal_to_vector(data, patient_id);
                     add_literal_to_vector(data, time);
 
-                    add_string_to_vector(data, code_array->Value(i));
-
-                    if (numeric_value_array->IsValid(i)) {
-                        non_null[0] = true;
-                        add_literal_to_vector(data,
-                                              numeric_value_array->Value(i));
-                    }
-
-                    if (datetime_value_array->IsValid(i)) {
-                        non_null[1] = true;
-                        add_literal_to_vector(data,
-                                              datetime_value_array->Value(i));
-                    }
-
-                    if (text_value_array->IsValid(i)) {
-                        non_null[2] = true;
-                        add_string_to_vector(data, text_value_array->Value(i));
-                    }
-
                     for (size_t j = 0; j < metadata_columns.size(); j++) {
-                        if (is_text_metadata[j]) {
-                            if (text_metadata_arrays[j] &&
-                                text_metadata_arrays[j]->IsValid(i)) {
-                                non_null[3 + j] = true;
+                        if (text_metadata_arrays[j] != nullptr) {
+                            if (text_metadata_arrays[j]->IsValid(i)) {
+                                non_null[j] = true;
                                 add_string_to_vector(
                                     data, text_metadata_arrays[j]->Value(i));
                             }
-                        } else {
-                            if (primitive_metadata_arrays[j] &&
-                                primitive_metadata_arrays[j]->IsValid(i)) {
-                                non_null[3 + j] = true;
+                        } else if (large_text_metadata_arrays[j] != nullptr) {
+                            if (large_text_metadata_arrays[j]->IsValid(i)) {
+                                non_null[j] = true;
+                                add_string_to_vector(
+                                    data,
+                                    large_text_metadata_arrays[j]->Value(i));
+                            }
+                        } else if (primitive_metadata_arrays[j] != nullptr) {
+                            if (primitive_metadata_arrays[j]->IsValid(i)) {
+                                non_null[j] = true;
                                 add_string_to_vector(
                                     data,
                                     primitive_metadata_arrays[j]->GetView(i));
@@ -954,44 +861,51 @@ void join_and_write_single(
     const std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>&
         metadata_columns) {
     arrow::FieldVector metadata_fields;
+    arrow::FieldVector measurement_fields;
     std::bitset<std::numeric_limits<unsigned long long>::digits>
         is_text_metadata;
+
     for (size_t i = 0; i < metadata_columns.size(); i++) {
+        arrow::FieldVector* fields = nullptr;
+
         const auto& metadata_column = metadata_columns[i];
+
+        if (std::find(std::begin(main_fields), std::end(main_fields),
+                      metadata_column.first) != std::end(main_fields)) {
+            fields = &measurement_fields;
+        } else {
+            fields = &metadata_fields;
+        }
+
         if (metadata_column.second->Equals(arrow::LargeStringType())) {
             is_text_metadata[i] = true;
-            metadata_fields.push_back(arrow::field(
+            fields->push_back(arrow::field(
+                metadata_column.first, std::make_shared<arrow::StringType>()));
+        } else if (metadata_column.second->Equals(arrow::StringType())) {
+            is_text_metadata[i] = true;
+            fields->push_back(arrow::field(
                 metadata_column.first, std::make_shared<arrow::StringType>()));
         } else {
             is_text_metadata[i] = false;
-            metadata_fields.push_back(
+            fields->push_back(
                 arrow::field(metadata_column.first, metadata_column.second));
         }
     }
 
     std::shared_ptr<arrow::DataType> metadata_type;
-    if (metadata_columns.size() != 0) {
+    if (metadata_fields.size() != 0) {
         metadata_type = std::make_shared<arrow::StructType>(metadata_fields);
     } else {
         metadata_type = std::make_shared<arrow::FloatType>();
     }
 
+    measurement_fields.push_back(arrow::field("metadata", metadata_type));
+
     auto timestamp_type =
         std::make_shared<arrow::TimestampType>(arrow::TimeUnit::MICRO);
 
-    auto measurement_type_fields = {
-        arrow::field("code", std::make_shared<arrow::StringType>()),
-
-        arrow::field("text_value", std::make_shared<arrow::StringType>()),
-        arrow::field("numeric_value", std::make_shared<arrow::FloatType>()),
-        arrow::field("datetime_value", std::make_shared<arrow::TimestampType>(
-                                           arrow::TimeUnit::MICRO)),
-
-        arrow::field("metadata", metadata_type),
-    };
-
     auto measurement_type =
-        std::make_shared<arrow::StructType>(measurement_type_fields);
+        std::make_shared<arrow::StructType>(measurement_fields);
 
     auto event_type_fields = {
         arrow::field("time", std::make_shared<arrow::TimestampType>(
@@ -1069,13 +983,6 @@ void join_and_write_single(
     auto static_measurements_builder =
         std::make_shared<arrow::NullBuilder>(pool);
 
-    auto code_builder = std::make_shared<arrow::StringBuilder>(pool);
-
-    auto text_value_builder = std::make_shared<arrow::StringBuilder>(pool);
-    auto numeric_value_builder = std::make_shared<arrow::FloatBuilder>(pool);
-    auto datetime_value_builder =
-        std::make_shared<arrow::TimestampBuilder>(timestamp_type, pool);
-
     std::vector<std::shared_ptr<arrow::StringBuilder>> text_metadata_builders(
         metadata_columns.size());
     std::vector<std::shared_ptr<arrow::FixedSizeBinaryBuilder>>
@@ -1085,23 +992,32 @@ void join_and_write_single(
     std::shared_ptr<arrow::FloatBuilder> null_metadata_builder;
     std::shared_ptr<arrow::ArrayBuilder> metadata_builder_holder;
 
-    if (metadata_columns.size() != 0) {
-        std::vector<std::shared_ptr<arrow::ArrayBuilder>> metadata_builders(
-            metadata_columns.size());
-        for (size_t i = 0; i < metadata_columns.size(); i++) {
-            if (is_text_metadata[i]) {
-                auto builder = std::make_shared<arrow::StringBuilder>(pool);
-                text_metadata_builders[i] = builder;
-                metadata_builders[i] = builder;
-            } else {
-                auto builder = std::make_shared<arrow::FixedSizeBinaryBuilder>(
-                    std::make_shared<arrow::FixedSizeBinaryType>(
-                        metadata_columns[i].second->byte_width()));
-                primitive_metadata_builders[i] = builder;
-                metadata_builders[i] = builder;
-            }
+    std::vector<std::shared_ptr<arrow::ArrayBuilder>> metadata_builders;
+    std::vector<std::shared_ptr<arrow::ArrayBuilder>> measurement_builders;
+
+    for (size_t i = 0; i < metadata_columns.size(); i++) {
+        std::vector<std::shared_ptr<arrow::ArrayBuilder>>* builders;
+        if (std::find(std::begin(main_fields), std::end(main_fields),
+                      metadata_columns[i].first) != std::end(main_fields)) {
+            builders = &measurement_builders;
+        } else {
+            builders = &metadata_builders;
         }
 
+        if (is_text_metadata[i]) {
+            auto builder = std::make_shared<arrow::StringBuilder>(pool);
+            text_metadata_builders[i] = builder;
+            builders->push_back(builder);
+        } else {
+            auto builder = std::make_shared<arrow::FixedSizeBinaryBuilder>(
+                std::make_shared<arrow::FixedSizeBinaryType>(
+                    metadata_columns[i].second->byte_width()));
+            primitive_metadata_builders[i] = builder;
+            builders->push_back(builder);
+        }
+    }
+
+    if (metadata_builders.size() > 0) {
         metadata_builder = std::make_shared<arrow::StructBuilder>(
             metadata_type, pool, metadata_builders);
         metadata_builder_holder = metadata_builder;
@@ -1110,13 +1026,10 @@ void join_and_write_single(
         metadata_builder_holder = null_metadata_builder;
     }
 
-    std::vector<std::shared_ptr<arrow::ArrayBuilder>>
-        measurement_builder_fields{
-            code_builder, text_value_builder, numeric_value_builder,
-            datetime_value_builder, metadata_builder_holder};
+    measurement_builders.push_back(metadata_builder_holder);
 
     auto measurement_builder = std::make_shared<arrow::StructBuilder>(
-        measurement_type, pool, measurement_builder_fields);
+        measurement_type, pool, measurement_builders);
 
     auto time_builder =
         std::make_shared<arrow::TimestampBuilder>(timestamp_type, pool);
@@ -1188,76 +1101,41 @@ void join_and_write_single(
         }
 
         PARQUET_THROW_NOT_OK(measurement_builder->Append());
+
+        if (metadata_builders.size() != 0) {
+            PARQUET_THROW_NOT_OK(metadata_builder->Append());
+        } else {
+            PARQUET_THROW_NOT_OK(null_metadata_builder->AppendNull());
+        }
+
         std::bitset<std::numeric_limits<unsigned long long>::digits> non_null(
             *reinterpret_cast<const unsigned long long*>(
                 patient_record.data() + patient_record.size() -
                 sizeof(unsigned long long)));
         size_t offset = sizeof(int64_t) * 2;
 
-        size_t size = *reinterpret_cast<const size_t*>(
-            patient_record.substr(offset).data());
-        offset += sizeof(size);
-        PARQUET_THROW_NOT_OK(
-            code_builder->Append(patient_record.substr(offset, size)));
-        offset += size;
+        for (size_t j = 0; j < metadata_columns.size(); j++) {
+            if (non_null[j]) {
+                size_t size = *reinterpret_cast<const size_t*>(
+                    patient_record.substr(offset).data());
+                offset += sizeof(size);
+                auto entry = patient_record.substr(offset, size);
 
-        if (non_null[0]) {
-            PARQUET_THROW_NOT_OK(
-                numeric_value_builder->Append(*reinterpret_cast<const float*>(
-                    patient_record.substr(offset).data())));
-            offset += sizeof(float);
-        } else {
-            PARQUET_THROW_NOT_OK(numeric_value_builder->AppendNull());
-        }
-
-        if (non_null[1]) {
-            PARQUET_THROW_NOT_OK(datetime_value_builder->Append(
-                *reinterpret_cast<const int64_t*>(
-                    patient_record.substr(offset).data())));
-            offset += sizeof(int64_t);
-        } else {
-            PARQUET_THROW_NOT_OK(datetime_value_builder->AppendNull());
-        }
-
-        if (non_null[2]) {
-            size_t size = *reinterpret_cast<const size_t*>(
-                patient_record.substr(offset).data());
-            offset += sizeof(size);
-            PARQUET_THROW_NOT_OK(text_value_builder->Append(
-                patient_record.substr(offset, size)));
-            offset += size;
-        } else {
-            PARQUET_THROW_NOT_OK(text_value_builder->AppendNull());
-        }
-
-        if (metadata_columns.size() == 0) {
-            PARQUET_THROW_NOT_OK(null_metadata_builder->AppendNull());
-        } else {
-            PARQUET_THROW_NOT_OK(metadata_builder->Append());
-
-            for (size_t j = 0; j < metadata_columns.size(); j++) {
-                if (non_null[3 + j]) {
-                    size_t size = *reinterpret_cast<const size_t*>(
-                        patient_record.substr(offset).data());
-                    offset += sizeof(size);
-                    auto entry = patient_record.substr(offset, size);
-
-                    if (is_text_metadata[j]) {
-                        PARQUET_THROW_NOT_OK(
-                            text_metadata_builders[j]->Append(entry));
-                    } else {
-                        PARQUET_THROW_NOT_OK(
-                            primitive_metadata_builders[j]->Append(entry));
-                    }
-                    offset += size;
+                if (is_text_metadata[j]) {
+                    PARQUET_THROW_NOT_OK(
+                        text_metadata_builders[j]->Append(entry));
                 } else {
-                    if (is_text_metadata[j]) {
-                        PARQUET_THROW_NOT_OK(
-                            text_metadata_builders[j]->AppendNull());
-                    } else {
-                        PARQUET_THROW_NOT_OK(
-                            primitive_metadata_builders[j]->AppendNull());
-                    }
+                    PARQUET_THROW_NOT_OK(
+                        primitive_metadata_builders[j]->Append(entry));
+                }
+                offset += size;
+            } else {
+                if (is_text_metadata[j]) {
+                    PARQUET_THROW_NOT_OK(
+                        text_metadata_builders[j]->AppendNull());
+                } else {
+                    PARQUET_THROW_NOT_OK(
+                        primitive_metadata_builders[j]->AppendNull());
                 }
             }
         }

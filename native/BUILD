@@ -54,12 +54,12 @@ cmake(
         "ARROW_WITH_ZSTD": "ON",
         "EP_COMMON_CMAKE_ARGS": "-DWITH_OPENSSL=OFF",
         "ARROW_DEPENDENCY_SOURCE": "BUNDLED",
+        "BUILD_WARNING_LEVEL": "PRODUCTION",
     },
     tags = ["requires-network"],
     generate_args = ["-DCMAKE_RANLIB=/usr/bin/ranlib"],
     working_directory="cpp",
     lib_source = "@arrow//:all",
-    out_lib_dir = "lib64",
     out_static_libs = ["libparquet.a", "libarrow.a", "libarrow_bundled_dependencies.a"],
     linkopts = ["-pthread"],
 )
@@ -72,6 +72,5 @@ cmake(
     },
     working_directory="build/cmake",
     lib_source = "@zstd//:all",
-    out_lib_dir = "lib64",
     out_static_libs = ["libzstd.a"],
 )
