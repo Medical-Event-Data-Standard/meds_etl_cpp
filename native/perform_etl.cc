@@ -194,13 +194,12 @@ std::vector<std::string> get_samples(
     moodycamel::BlockingConcurrentQueue<absl::optional<std::string>>&
         file_queue) {
     arrow::MemoryPool* pool = arrow::default_memory_pool();
-    absl::flat_hash_map<uint64_t, uint8_t> string_status;
+    absl::flat_hash_map<size_t, uint8_t> string_status;
 
     std::vector<std::string> unique_strings;
 
     auto process_function = [&](std::string_view item) {
-        static_assert(std::is_same_v<uint64_t, size_t>);
-        uint64_t h = std::hash<decltype(item)>{}(item);
+        size_t h = std::hash<decltype(item)>{}(item);
         uint8_t& value = string_status[h];
 
         if (value == 0) {
