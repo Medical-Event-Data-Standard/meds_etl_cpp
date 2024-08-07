@@ -1,4 +1,5 @@
 dist
+.vscode
 native/bazel-*
 *.so
 *egg-info
