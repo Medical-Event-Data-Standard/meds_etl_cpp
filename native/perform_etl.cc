@@ -9,6 +9,8 @@
 #include <string>
 #include <thread>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/types/optional.h"
 #include "arrow/array/array_binary.h"
 #include "arrow/array/array_primitive.h"
@@ -22,34 +24,17 @@
 #include "arrow/util/type_fwd.h"
 #include "blockingconcurrentqueue.h"
 #include "lightweightsemaphore.h"
+#include "mmap_file.hh"
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
 #include "parquet/arrow/writer.h"
 #include "pdqsort.h"
-#include "zstd.h"
+
+namespace {
 
 namespace fs = std::filesystem;
 
-const size_t SHARD_PIECE_SIZE =
-    ((size_t)4 * 1000) * 1000 * 1000;  // Roughly 4 gigabytes
-const size_t PARQUET_PIECE_SIZE =
-    ((size_t)100) * 1000 * 1000;  // Roughly 100 megabytes
-const size_t COMPRESSION_BUFFER_SIZE = 1 * 1000 * 1000;  // Roughly 1 megabytes
-
-template <typename T, bool reversed = false>
-struct EventComparator {
-    bool operator()(const T& a, const T& b) const {
-        if (reversed) {
-            return (std::get<0>(a) > std::get<0>(b)) |
-                   ((std::get<0>(a) == std::get<0>(b)) &
-                    (std::get<1>(a) > std::get<1>(b)));
-        } else {
-            return (std::get<0>(a) < std::get<0>(b)) |
-                   ((std::get<0>(a) == std::get<0>(b)) &
-                    (std::get<1>(a) < std::get<1>(b)));
-        }
-    }
-};
+const size_t PARQUET_PIECE_SIZE = 10 * 1000;
 
 std::vector<std::shared_ptr<::arrow::Field>> get_fields_for_file(
     arrow::MemoryPool* pool, const std::string& filename) {
@@ -89,9 +74,7 @@ std::vector<std::shared_ptr<::arrow::Field>> get_fields_for_file(
     return fields;
 }
 
-const std::vector<std::string> known_fields = {
-    "patient_id",    "time",           "code",
-    "numeric_value", "datetime_value", "text_value"};
+const std::vector<std::string> known_fields = {"patient_id", "time"};
 
 std::set<std::pair<std::string, std::shared_ptr<arrow::DataType>>>
 get_properties_fields(const std::vector<std::string>& files) {
@@ -152,34 +135,297 @@ get_properties_fields_multithreaded(const std::vector<std::string>& files,
     return result;
 }
 
-template <typename T>
-void add_literal_to_vector(std::vector<char>& data, T to_add) {
-    const char* bytes = reinterpret_cast<const char*>(&to_add);
-    data.insert(std::end(data), bytes, bytes + sizeof(T));
-}
-
-void add_string_to_vector(std::vector<char>& data, std::string_view to_add) {
-    add_literal_to_vector(data, to_add.size());
-    data.insert(std::end(data), std::begin(to_add), std::end(to_add));
-}
-
 using QueueItem = absl::optional<std::vector<char>>;
 
-constexpr ssize_t SEMAPHORE_BLOCK_SIZE = 1000;
+constexpr int QUEUE_SIZE = 1000;
+constexpr ssize_t SEMAPHORE_BLOCK_SIZE = 100;
+
+std::map<std::string, std::pair<std::shared_ptr<arrow::DataType>, int64_t>>
+get_properties(const parquet::arrow::SchemaManifest& manifest) {
+    std::map<std::string, std::pair<std::shared_ptr<arrow::DataType>, int64_t>>
+        result;
+
+    std::queue<parquet::arrow::SchemaField> to_process;
+    for (const auto& field : manifest.schema_fields) {
+        to_process.emplace(std::move(field));
+    }
+
+    auto helper = [&](parquet::arrow::SchemaField& field) {
+        if (!field.is_leaf()) {
+            throw std::runtime_error(
+                "meds_etl_cpp only supports leaf properties");
+        }
+        result[field.field->name()] =
+            std::make_pair(field.field->type(), field.column_index);
+    };
+
+    while (!to_process.empty()) {
+        parquet::arrow::SchemaField next = std::move(to_process.front());
+        to_process.pop();
+        helper(next);
+    }
+
+    return result;
+}
+
+template <typename A, typename F>
+void process_string_column(const std::string& property_name,
+                           const std::shared_ptr<arrow::Table>& table, F func) {
+    auto chunked_values = table->GetColumnByName(property_name);
+
+    for (const auto& array : chunked_values->chunks()) {
+        auto string_array = std::dynamic_pointer_cast<A>(array);
+        if (string_array == nullptr) {
+            throw std::runtime_error("Could not cast property");
+        }
+
+        for (int64_t i = 0; i < string_array->length(); i++) {
+            if (!string_array->IsNull(i)) {
+                std::string_view item = string_array->GetView(i);
+                if (!item.empty()) {
+                    func(item);
+                }
+            }
+        }
+    }
+}
+
+std::vector<std::string> get_samples(
+    moodycamel::BlockingConcurrentQueue<absl::optional<std::string>>&
+        file_queue) {
+    arrow::MemoryPool* pool = arrow::default_memory_pool();
+    absl::flat_hash_map<uint64_t, uint8_t> string_status;
+
+    std::vector<std::string> unique_strings;
+
+    auto process_function = [&](std::string_view item) {
+        static_assert(std::is_same_v<uint64_t, size_t>);
+        uint64_t h = std::hash<decltype(item)>{}(item);
+        uint8_t& value = string_status[h];
+
+        if (value == 0) {
+            value = 1;
+        } else if (value == 1) {
+            unique_strings.emplace_back(item);
+            value = 2;
+        }
+    };
+
+    absl::optional<std::string> item;
+    while (true) {
+        file_queue.wait_dequeue(item);
+
+        if (!item) {
+            break;
+        } else {
+            auto source = *item;
+
+            // Configure general Parquet reader settings
+            auto reader_properties = parquet::ReaderProperties(pool);
+            reader_properties.set_buffer_size(1024 * 1024);
+            reader_properties.enable_buffered_stream();
+
+            // Configure Arrow-specific Parquet reader settings
+            auto arrow_reader_props = parquet::ArrowReaderProperties();
+            arrow_reader_props.set_batch_size(128 * 1024);  // default 64 * 1024
+
+            parquet::arrow::FileReaderBuilder reader_builder;
+            PARQUET_THROW_NOT_OK(reader_builder.OpenFile(
+                source, /*memory_map=*/false, reader_properties));
+            reader_builder.memory_pool(pool);
+            reader_builder.properties(arrow_reader_props);
+
+            std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
+            PARQUET_ASSIGN_OR_THROW(arrow_reader, reader_builder.Build());
+
+            auto properties = get_properties(arrow_reader->manifest());
+
+            std::vector<int> columns;
+            std::vector<std::string> large_string_columns;
+            std::vector<std::string> string_columns;
+
+            for (const auto& entry : properties) {
+                if (entry.second.first->Equals(arrow::StringType())) {
+                    string_columns.push_back(entry.first);
+                    columns.push_back(entry.second.second);
+                } else if (entry.second.first->Equals(
+                               arrow::LargeStringType())) {
+                    large_string_columns.push_back(entry.first);
+                    columns.push_back(entry.second.second);
+                }
+            }
+
+            for (int64_t row_group = 0;
+                 row_group < arrow_reader->num_row_groups(); row_group++) {
+                std::shared_ptr<arrow::Table> table;
+                PARQUET_THROW_NOT_OK(
+                    arrow_reader->ReadRowGroup(row_group, columns, &table));
+
+                for (const auto& s_column : string_columns) {
+                    process_string_column<arrow::StringArray>(s_column, table,
+                                                              process_function);
+                }
+
+                for (const auto& s_column : large_string_columns) {
+                    process_string_column<arrow::LargeStringArray>(
+                        s_column, table, process_function);
+                }
+            }
+        }
+    }
+
+    return unique_strings;
+}
+
+template <typename C>
+struct ChunkedArrayIterator {
+    ChunkedArrayIterator(const std::shared_ptr<arrow::ChunkedArray>& a)
+        : array(a) {
+        chunk_index = 0;
+        current_chunk = std::dynamic_pointer_cast<C>(array->chunk(chunk_index));
+
+        if (!current_chunk) {
+            throw std::runtime_error("Could not cast time array");
+        }
+        array_index = 0;
+    }
+
+    bool has_next() { return chunk_index < array->num_chunks(); }
+
+    const std::shared_ptr<C>& current_array() { return current_chunk; }
+
+    int64_t current_index() { return array_index; }
+
+    void increment() {
+        array_index++;
+        if (array_index == current_chunk->length()) {
+            chunk_index++;
+            if (chunk_index < array->num_chunks()) {
+                current_chunk =
+                    std::dynamic_pointer_cast<C>(array->chunk(chunk_index));
+
+                if (!current_chunk) {
+                    throw std::runtime_error("Could not cast time array");
+                }
+            }
+
+            array_index = 0;
+        }
+    }
+
+    std::shared_ptr<arrow::ChunkedArray> array;
+    int chunk_index;
+    std::shared_ptr<C> current_chunk;
+    int64_t array_index;
+};
+
+struct ArrayEncoder {
+    virtual std::optional<std::string> encode_next(
+        const absl::flat_hash_map<std::string, uint32_t>& dictionary) = 0;
+    virtual ~ArrayEncoder() {}
+};
+
+constexpr uint32_t DICTIONARY_MASK = ((uint32_t)(1)) << ((uint32_t)(31));
+
+template <typename C>
+struct StringRowIterator : ChunkedArrayIterator<C>, ArrayEncoder {
+    StringRowIterator(const std::shared_ptr<arrow::ChunkedArray>& a)
+        : ChunkedArrayIterator<C>(a) {}
+
+    std::string_view get_next() {
+        std::string_view result;
+        if (this->current_array()->IsValid(this->current_index())) {
+            result = this->current_array()->GetView(this->current_index());
+        }
+        this->increment();
+        return result;
+    }
+
+    std::optional<std::string> encode_next(
+        const absl::flat_hash_map<std::string, uint32_t>& dictionary) {
+        auto next = get_next();
+        if (next.empty()) {
+            return std::nullopt;
+        } else {
+            auto iter = dictionary.find(next);
+            if (iter != std::end(dictionary)) {
+                uint32_t index = iter->second;
+                return std::string(
+                    std::string_view((const char*)&index, sizeof(index)));
+            } else {
+                uint32_t size = next.size() | DICTIONARY_MASK;
+
+                std::string temp(
+                    std::string_view((const char*)&size, sizeof(size)));
+                temp.insert(std::end(temp), std::begin(next), std::end(next));
+
+                return temp;
+            }
+        }
+    }
+};
+
+struct PrimitiveRowIterator : ChunkedArrayIterator<arrow::PrimitiveArray>,
+                              ArrayEncoder {
+    PrimitiveRowIterator(const std::shared_ptr<arrow::ChunkedArray>& a)
+        : ChunkedArrayIterator<arrow::PrimitiveArray>(a) {
+        type_bytes = a->type()->byte_width();
+    }
+
+    int32_t type_bytes;
+
+    std::string_view get_next() {
+        std::string_view result;
+        if (current_array()->IsValid(current_index())) {
+            result = std::string_view(
+                (const char*)current_array()->values()->data() +
+                    (current_array()->offset() + current_index()) * type_bytes,
+                (size_t)type_bytes);
+        }
+        this->increment();
+        return result;
+    }
+
+    std::optional<std::string> encode_next(
+        const absl::flat_hash_map<std::string, uint32_t>& dictionary) {
+        auto next = get_next();
+        if (next.empty()) {
+            return std::nullopt;
+        } else {
+            return std::string(next);
+        }
+    }
+};
+
+template <typename C>
+struct NumericRowIterator : ChunkedArrayIterator<C> {
+    NumericRowIterator(const std::shared_ptr<arrow::ChunkedArray>& a)
+        : ChunkedArrayIterator<C>(a) {}
+
+    std::optional<typename C::value_type> get_next() {
+        std::optional<typename C::value_type> result;
+        if (this->current_array()->IsValid(this->current_index())) {
+            result = this->current_array()->Value(this->current_index());
+        }
+        this->increment();
+        return result;
+    }
+};
 
 void shard_reader(
-    size_t reader_index, size_t num_shards,
+    size_t reader_index, size_t num_shards, size_t num_threads,
     moodycamel::BlockingConcurrentQueue<absl::optional<std::string>>&
         file_queue,
     std::vector<moodycamel::BlockingConcurrentQueue<QueueItem>>&
         all_write_queues,
     moodycamel::LightweightSemaphore& all_write_semaphore,
     const std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>&
-        properties_columns) {
+        properties_columns,
+    const absl::flat_hash_map<std::string, uint32_t>& dictionary) {
     arrow::MemoryPool* pool = arrow::default_memory_pool();
 
     std::vector<moodycamel::ProducerToken> ptoks;
-    for (size_t i = 0; i < num_shards; i++) {
+    for (size_t i = 0; i < num_threads; i++) {
         ptoks.emplace_back(all_write_queues[i]);
     }
 
@@ -212,308 +458,104 @@ void shard_reader(
             std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
             PARQUET_ASSIGN_OR_THROW(arrow_reader, reader_builder.Build());
 
-            int patient_id_index = -1;
-            int time_index = -1;
-            int code_index = -1;
-
-            int numeric_value_index = -1;
-            int datetime_value_index = -1;
-            int text_value_index = -1;
-
             std::vector<int> properties_indices(properties_columns.size(), -1);
 
-            std::bitset<std::numeric_limits<unsigned long long>::digits>
-                is_text_properties;
+            for (int64_t row_group = 0;
+                 row_group < arrow_reader->num_row_groups(); row_group++) {
+                std::shared_ptr<arrow::Table> table;
+                PARQUET_THROW_NOT_OK(
+                    arrow_reader->ReadRowGroup(row_group, &table));
 
-            const auto& manifest = arrow_reader->manifest();
-            for (const auto& schema_field : manifest.schema_fields) {
-                if (schema_field.children.size() != 0 ||
-                    !schema_field.is_leaf()) {
-                    throw std::runtime_error(
-                        "For MEDS-Flat fields should not be nested, but we "
-                        "have a non-nested field " +
-                        schema_field.field->name());
+                NumericRowIterator<arrow::Int64Array> patient_id_column(
+                    table->GetColumnByName("patient_id"));
+                NumericRowIterator<arrow::TimestampArray> time_column(
+                    table->GetColumnByName("time"));
+
+                auto time_type =
+                    std::dynamic_pointer_cast<arrow::TimestampType>(
+                        table->GetColumnByName("time")->type());
+
+                if (time_type->unit() != arrow::TimeUnit::MICRO) {
+                    throw std::runtime_error("Wrong units for timestamp");
                 }
 
-                if (schema_field.field->name() == "patient_id") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::Int64Type())) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires Int64 patient_ids but "
-                            "found " +
-                            schema_field.field->ToString());
-                    }
-                    patient_id_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "time") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::TimestampType(arrow::TimeUnit::MICRO))) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires microsecond timestamp "
-                            "times but found " +
-                            schema_field.field->ToString());
-                    }
-                    time_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "code") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::LargeStringType())) {
-                        throw std::runtime_error(
-                            "The C++ MEDS-Flat ETL requires large_string codes "
-                            "but found " +
-                            schema_field.field->ToString());
-                    }
-
-                    code_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "numeric_value") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::FloatType())) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires Float numeric_value but "
-                            "found " +
-                            schema_field.field->ToString());
-                    }
-                    numeric_value_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "datetime_value") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::TimestampType(arrow::TimeUnit::MICRO))) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires microsecond timestamp "
-                            "datetime_value but found " +
-                            schema_field.field->ToString());
-                    }
-                    datetime_value_index = schema_field.column_index;
-                } else if (schema_field.field->name() == "text_value") {
-                    if (!schema_field.field->type()->Equals(
-                            arrow::LargeStringType())) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires Float32 numeric_value but "
-                            "found " +
-                            schema_field.field->ToString());
-                    }
-                    text_value_index = schema_field.column_index;
-                } else {
-                    // Must be properties
-                    auto iter = std::find_if(
-                        std::begin(properties_columns),
-                        std::end(properties_columns), [&](const auto& entry) {
-                            return entry.first == schema_field.field->name();
-                        });
-                    if (iter == std::end(properties_columns)) {
-                        throw std::runtime_error(
-                            "Had an extra column in the properties that "
-                            "shouldn't exist? " +
-                            schema_field.field->ToString());
-                    }
-
-                    if (!schema_field.field->type()->Equals(iter->second)) {
-                        throw std::runtime_error(
-                            "C++ MEDS-Flat requires large_string properties "
-                            "but "
-                            "found " +
-                            schema_field.field->ToString());
-                    }
-
-                    int offset = (iter - std::begin(properties_columns));
-
-                    if (iter->second->Equals(arrow::LargeStringType())) {
-                        is_text_properties[offset] = true;
-                    } else {
-                        is_text_properties[offset] = false;
-
-                        if (iter->second->byte_width() == -1) {
-                            throw std::runtime_error(
-                                "Found non text properties with unknown byte "
-                                "width? " +
-                                iter->second->ToString());
-                        }
-                    }
-
-                    properties_indices[offset] = schema_field.column_index;
-                }
-            }
-
-            if (patient_id_index == -1) {
-                throw std::runtime_error(
-                    "Could not find patient_id column index");
-            }
-
-            if (time_index == -1) {
-                throw std::runtime_error("Could not find time column index");
-            }
-
-            if (code_index == -1) {
-                throw std::runtime_error("Could not find code column index");
-            }
-
-            std::shared_ptr<::arrow::RecordBatchReader> rb_reader;
-            PARQUET_THROW_NOT_OK(
-                arrow_reader->GetRecordBatchReader(&rb_reader));
-
-            std::shared_ptr<arrow::RecordBatch> record_batch;
-
-            while (true) {
-                PARQUET_THROW_NOT_OK(rb_reader->ReadNext(&record_batch));
-
-                if (!record_batch) {
-                    break;
+                if (!time_type->timezone().empty()) {
+                    throw std::runtime_error("Need an empty timezone");
                 }
 
-                auto patient_id_array = std::dynamic_pointer_cast<
-                    arrow::NumericArray<arrow::Int64Type>>(
-                    record_batch->column(patient_id_index));
-                if (!patient_id_array) {
-                    throw std::runtime_error("Could not cast patient_id array");
-                }
-
-                auto time_array = std::dynamic_pointer_cast<
-                    arrow::NumericArray<arrow::TimestampType>>(
-                    record_batch->column(time_index));
-                if (!time_array) {
-                    throw std::runtime_error("Could not cast time array");
-                }
-
-                auto code_array =
-                    std::dynamic_pointer_cast<arrow::LargeStringArray>(
-                        record_batch->column(code_index));
-                if (!code_array) {
-                    throw std::runtime_error("Could not cast code array");
-                }
-
-                auto numeric_value_array = std::dynamic_pointer_cast<
-                    arrow::NumericArray<arrow::FloatType>>(
-                    record_batch->column(numeric_value_index));
-                if (!numeric_value_array) {
-                    throw std::runtime_error(
-                        "Could not cast numeric_value array");
-                }
-
-                auto datetime_value_array = std::dynamic_pointer_cast<
-                    arrow::NumericArray<arrow::TimestampType>>(
-                    record_batch->column(datetime_value_index));
-                if (!datetime_value_array) {
-                    throw std::runtime_error(
-                        "Could not cast datetime_value array");
-                }
-
-                auto text_value_array =
-                    std::dynamic_pointer_cast<arrow::LargeStringArray>(
-                        record_batch->column(text_value_index));
-                if (!text_value_array) {
-                    throw std::runtime_error("Could not cast text_value array");
-                }
-
-                std::vector<std::shared_ptr<arrow::LargeStringArray>>
-                    text_properties_arrays(properties_columns.size());
-                std::vector<std::shared_ptr<arrow::FixedSizeBinaryArray>>
-                    primitive_properties_arrays(properties_columns.size());
+                std::vector<std::pair<size_t, std::unique_ptr<ArrayEncoder>>>
+                    encoders;
 
                 for (size_t i = 0; i < properties_columns.size(); i++) {
-                    if (properties_indices[i] == -1) {
+                    const auto& property = properties_columns[i];
+
+                    auto chunks = table->GetColumnByName(property.first);
+
+                    if (!chunks) {
                         continue;
                     }
 
-                    if (is_text_properties[i]) {
-                        auto properties_array =
-                            std::dynamic_pointer_cast<arrow::LargeStringArray>(
-                                record_batch->column(properties_indices[i]));
-                        if (!properties_array) {
-                            throw std::runtime_error(
-                                "Could not cast properties array to text" +
-                                properties_columns[i].first + " " +
-                                properties_columns[i].second->ToString());
-                        }
-                        text_properties_arrays[i] = properties_array;
+                    if (property.second->Equals(arrow::StringType())) {
+                        encoders.emplace_back(
+                            i,
+                            std::make_unique<
+                                StringRowIterator<arrow::StringArray>>(chunks));
+                    } else if (property.second->Equals(
+                                   arrow::LargeStringType())) {
+                        encoders.emplace_back(
+                            i, std::make_unique<
+                                   StringRowIterator<arrow::LargeStringArray>>(
+                                   chunks));
                     } else {
-                        std::shared_ptr<arrow::Array> fixed_size_array;
-                        PARQUET_ASSIGN_OR_THROW(
-                            fixed_size_array,
-                            record_batch->column(properties_indices[i])
-                                ->View(std::make_shared<
-                                       arrow::FixedSizeBinaryType>(
-                                    properties_columns[i]
-                                        .second->byte_width())));
-
-                        auto properties_array = std::dynamic_pointer_cast<
-                            arrow::FixedSizeBinaryArray>(fixed_size_array);
-                        if (!properties_array) {
-                            throw std::runtime_error(
-                                "Could not cast properties array to fixed "
-                                "size " +
-                                properties_columns[i].first + " " +
-                                properties_columns[i].second->ToString());
-                        }
-                        primitive_properties_arrays[i] = properties_array;
+                        encoders.emplace_back(
+                            i, std::make_unique<PrimitiveRowIterator>(chunks));
                     }
                 }
 
-                for (int64_t i = 0; i < text_value_array->length(); i++) {
-                    if (!patient_id_array->IsValid(i)) {
-                        throw std::runtime_error(
-                            "patient_id incorrectly has null value " + source);
-                    }
-                    if (!time_array->IsValid(i)) {
-                        throw std::runtime_error(
-                            "time incorrectly has null value " + source);
-                    }
-                    if (!code_array->IsValid(i)) {
-                        throw std::runtime_error(
-                            "code incorrectly has null value " + source);
+                while (patient_id_column.has_next()) {
+                    auto possible_patient_id = patient_id_column.get_next();
+                    if (!possible_patient_id) {
+                        throw std::runtime_error("Missing a patient id value");
                     }
 
-                    std::vector<char> data;
+                    int64_t patient_id = *possible_patient_id;
+                    std::optional<int64_t> possible_time =
+                        time_column.get_next();
 
-                    int64_t patient_id = patient_id_array->Value(i);
-                    int64_t time = time_array->Value(i);
-
-                    std::bitset<std::numeric_limits<unsigned long long>::digits>
-                        non_null;
-
-                    add_literal_to_vector(data, patient_id);
-                    add_literal_to_vector(data, time);
-
-                    add_string_to_vector(data, code_array->Value(i));
-
-                    if (numeric_value_array->IsValid(i)) {
-                        non_null[0] = true;
-                        add_literal_to_vector(data,
-                                              numeric_value_array->Value(i));
+                    int64_t time = std::numeric_limits<int64_t>::min();
+                    if (possible_time) {
+                        time = *possible_time;
                     }
 
-                    if (datetime_value_array->IsValid(i)) {
-                        non_null[1] = true;
-                        add_literal_to_vector(data,
-                                              datetime_value_array->Value(i));
+                    std::bitset<64> is_valid;
+                    std::vector<char> result(sizeof(uint64_t) * 3);
+
+                    {
+                        int64_t* id_map = (int64_t*)(result.data());
+                        id_map[0] = patient_id;
+                        id_map[1] = time;
                     }
 
-                    if (text_value_array->IsValid(i)) {
-                        non_null[2] = true;
-                        add_string_to_vector(data, text_value_array->Value(i));
-                    }
-
-                    for (size_t j = 0; j < properties_columns.size(); j++) {
-                        if (is_text_properties[j]) {
-                            if (text_properties_arrays[j] &&
-                                text_properties_arrays[j]->IsValid(i)) {
-                                non_null[3 + j] = true;
-                                add_string_to_vector(
-                                    data, text_properties_arrays[j]->Value(i));
-                            }
-                        } else {
-                            if (primitive_properties_arrays[j] &&
-                                primitive_properties_arrays[j]->IsValid(i)) {
-                                non_null[3 + j] = true;
-                                add_string_to_vector(
-                                    data,
-                                    primitive_properties_arrays[j]->GetView(i));
-                            }
+                    for (auto& encoder : encoders) {
+                        auto entry = encoder.second->encode_next(dictionary);
+                        if (entry) {
+                            is_valid.set(encoder.first);
+                            result.insert(std::end(result), std::begin(*entry),
+                                          std::end(*entry));
                         }
                     }
 
-                    add_literal_to_vector(data, non_null.to_ullong());
+                    uint64_t* null_map =
+                        (uint64_t*)(result.data() + sizeof(int64_t) * 2);
+
+                    *null_map = is_valid.to_ulong();
 
                     size_t index =
                         std::hash<int64_t>()(patient_id) % num_shards;
-                    all_write_queues[index].enqueue(ptoks[index],
-                                                    std::move(data));
+                    size_t thread_index = index % num_threads;
+
+                    all_write_queues[thread_index].enqueue(ptoks[thread_index],
+                                                           std::move(result));
 
                     slots_to_write--;
                     if (slots_to_write == 0) {
@@ -525,7 +567,7 @@ void shard_reader(
         }
     }
 
-    for (size_t j = 0; j < num_shards; j++) {
+    for (size_t j = 0; j < num_threads; j++) {
         all_write_queues[j].enqueue(ptoks[j], absl::nullopt);
     }
 
@@ -534,193 +576,21 @@ void shard_reader(
     }
 }
 
-class ZstdRowWriter {
-   public:
-    ZstdRowWriter(const std::string& path, ZSTD_CCtx* ctx)
-        : fname(path),
-          fstream(path, std::ifstream::out | std::ifstream::binary),
-          context(ctx) {}
-
-    void add_next(std::string_view data) {
-        add_string_to_vector(uncompressed_buffer,
-                             std::string_view(data.data(), data.size()));
-
-        if (uncompressed_buffer.size() > COMPRESSION_BUFFER_SIZE) {
-            flush_compressed();
-        }
-    }
-
-    ~ZstdRowWriter() {
-        if (uncompressed_buffer.size() > 0) {
-            flush_compressed();
-        }
-    }
-
-    const std::string fname;
-
-   private:
-    void flush_compressed() {
-        size_t needed_size = ZSTD_compressBound(uncompressed_buffer.size());
-
-        if (compressed_buffer.size() < needed_size) {
-            compressed_buffer.resize(needed_size * 2);
-        }
-
-        size_t compressed_length = ZSTD_compressCCtx(
-            context, compressed_buffer.data(), compressed_buffer.size(),
-            uncompressed_buffer.data(), uncompressed_buffer.size(), 1);
-
-        if (ZSTD_isError(compressed_length)) {
-            throw std::runtime_error("Could not compress using zstd?");
-        }
-
-        fstream.write(reinterpret_cast<char*>(&compressed_length),
-                      sizeof(compressed_length));
-        fstream.write(compressed_buffer.data(), compressed_length);
-
-        uncompressed_buffer.clear();
-    }
-
-    std::ofstream fstream;
-
-    ZSTD_CCtx* context;
-
-    std::vector<char> compressed_buffer;
-    std::vector<char> uncompressed_buffer;
-};
-
-class ZstdRowReader {
-   public:
-    ZstdRowReader(const std::string& path, ZSTD_DCtx* ctx)
-        : fname(path),
-          fstream(path, std::ifstream::in | std::ifstream::binary),
-          context(ctx),
-          current_offset(0),
-          uncompressed_size(0) {}
-
-    absl::optional<std::tuple<int64_t, int64_t, std::string_view>> get_next() {
-        if (current_offset == uncompressed_size) {
-            bool could_load_more = try_to_load_more_data();
-
-            if (!could_load_more) {
-                return {};
-            }
-
-            assert(current_offset < uncompressed_size);
-        }
-
-        assert(compressed_buffer.size() >= sizeof(size_t));
-
-        size_t size = *reinterpret_cast<const size_t*>(
-            uncompressed_buffer.data() + current_offset);
-        current_offset += sizeof(size);
-
-        std::string_view data(uncompressed_buffer.data() + current_offset,
-                              size);
-        current_offset += size;
-
-        assert(data.size() >= sizeof(int64_t) * 2);
-        assert(data.data() != nullptr);
-
-        int64_t patient_id = *reinterpret_cast<const int64_t*>(data.data() + 0);
-        int64_t time =
-            *reinterpret_cast<const int64_t*>(data.data() + sizeof(int64_t));
-
-        return std::make_tuple(patient_id, time, data);
-    }
-
-   private:
-    bool try_to_load_more_data() {
-        if (fstream.eof()) {
-            return false;
-        }
-
-        size_t size;
-        fstream.read(reinterpret_cast<char*>(&size), sizeof(size));
-
-        if (fstream.eof()) {
-            return false;
-        }
-
-        if (compressed_buffer.size() < size) {
-            compressed_buffer.resize(size * 2);
-        }
-
-        fstream.read(compressed_buffer.data(), size);
-
-        uncompressed_size =
-            ZSTD_getFrameContentSize(compressed_buffer.data(), size);
-
-        if (uncompressed_size == ZSTD_CONTENTSIZE_ERROR ||
-            uncompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
-            throw std::runtime_error(
-                "Could not get the size of the zstd compressed stream?");
-        }
-
-        if (uncompressed_buffer.size() < uncompressed_size) {
-            uncompressed_buffer.resize(uncompressed_size * 2);
-        }
-
-        size_t read_size = ZSTD_decompressDCtx(
-            context, uncompressed_buffer.data(), uncompressed_size,
-            compressed_buffer.data(), size);
-
-        if (ZSTD_isError(read_size) || read_size != uncompressed_size) {
-            throw std::runtime_error("Could not decompress zstd data?");
-        }
-
-        current_offset = 0;
-        return true;
-    }
-
-    const std::string fname;
-    std::ifstream fstream;
-
-    ZSTD_DCtx* context;
-
-    std::vector<char> compressed_buffer;
-    std::vector<char> uncompressed_buffer;
-    size_t current_offset;
-    size_t uncompressed_size;
-};
-
-void shard_writer(
-    size_t writer_index, size_t num_shards,
-    moodycamel::BlockingConcurrentQueue<QueueItem>& write_queue,
-    moodycamel::LightweightSemaphore& write_semaphore,
-    const std::filesystem::path& target_dir,
-    moodycamel::BlockingConcurrentQueue<std::string>& sort_file_queue,
-    std::atomic<ssize_t>& remaining_live_writers) {
+void shard_writer(size_t writer_index, size_t num_shards, size_t num_threads,
+                  moodycamel::BlockingConcurrentQueue<QueueItem>& write_queue,
+                  moodycamel::LightweightSemaphore& write_semaphore,
+                  const std::filesystem::path& target_dir) {
     std::filesystem::create_directory(target_dir);
 
-    size_t current_size = 0;
+    std::vector<std::ofstream> subshards;
 
-    size_t current_file_index = 0;
-
-    auto context_deleter = [](ZSTD_CCtx* context) { ZSTD_freeCCtx(context); };
-
-    std::unique_ptr<ZSTD_CCtx, decltype(context_deleter)> context{
-        ZSTD_createCCtx(), context_deleter};
-
-    std::optional<ZstdRowWriter> current_writer;
-
-    auto init_file = [&]() {
-        auto target_file = target_dir / std::to_string(current_file_index);
-        current_writer.emplace(target_file, context.get());
-    };
-
-    auto flush_file = [&]() {
-        std::string target_file = current_writer->fname;
-        current_writer.reset();
-
-        sort_file_queue.enqueue(target_file);
-
-        current_size = 0;
-        current_file_index += 1;
-    };
+    for (size_t i = writer_index; i < num_shards; i += num_threads) {
+        auto target_file = target_dir / std::to_string(i);
+        subshards.emplace_back(target_file, std::ios_base::binary);
+    }
 
     QueueItem item;
-    size_t readers_remaining = num_shards;
+    size_t readers_remaining = num_threads;
 
     moodycamel::ConsumerToken ctok(write_queue);
 
@@ -745,113 +615,79 @@ void shard_writer(
         }
 
         std::vector<char>& r = *item;
+        int64_t* patient_id_ptr = (int64_t*)r.data();
+        int64_t patient_id = *patient_id_ptr;
 
-        if (!current_writer) {
-            init_file();
-        }
-
-        current_writer->add_next(std::string_view(r.data(), r.size()));
-
-        current_size += sizeof(size_t) + r.size();
-
-        if (current_size > SHARD_PIECE_SIZE) {
-            flush_file();
-        }
+        size_t shard = std::hash<int64_t>()(patient_id) % num_shards;
+        size_t index = shard / num_threads;
+        int64_t size = r.size();
+        subshards[index].write((const char*)&size, sizeof(size));
+        subshards[index].write(r.data(), r.size());
     }
 
     write_semaphore.signal(num_read);
-
-    if (current_writer) {
-        flush_file();
-    }
-
-    remaining_live_writers.fetch_sub(1, std::memory_order_release);
 }
 
-void shard_sort(
-    moodycamel::BlockingConcurrentQueue<std::string>& sort_file_queue,
-    const std::atomic<ssize_t>& remaining_live_writers) {
-    absl::optional<std::string> next_entry;
+std::pair<absl::flat_hash_map<std::string, uint32_t>, std::vector<std::string>>
+compute_string_dictionary(const std::filesystem::path& source_directory,
+                          size_t num_threads) {
+    std::vector<std::string> paths;
 
-    std::vector<char> data;
-    std::vector<std::tuple<int64_t, int64_t, size_t, size_t>> row_indices;
+    for (const auto& entry : fs::directory_iterator(source_directory)) {
+        paths.push_back(entry.path());
+    }
 
-    auto compression_context_deleter = [](ZSTD_CCtx* context) {
-        ZSTD_freeCCtx(context);
-    };
-    auto decompression_context_deleter = [](ZSTD_DCtx* context) {
-        ZSTD_freeDCtx(context);
-    };
+    moodycamel::BlockingConcurrentQueue<absl::optional<std::string>> file_queue;
 
-    std::unique_ptr<ZSTD_CCtx, decltype(compression_context_deleter)>
-        compression_context{ZSTD_createCCtx(), compression_context_deleter};
+    for (const auto& path : paths) {
+        file_queue.enqueue(path);
+    }
 
-    std::unique_ptr<ZSTD_DCtx, decltype(decompression_context_deleter)>
-        decompression_context{ZSTD_createDCtx(), decompression_context_deleter};
+    for (size_t i = 0; i < num_threads; i++) {
+        file_queue.enqueue({});
+    }
 
-    std::string filename;
-    while (true) {
-        while (true) {
-            bool found = sort_file_queue.wait_dequeue_timed(filename, 1e6);
-            if (found) {
-                break;
-            }
+    std::vector<std::vector<std::string>> strings_per_thread(num_threads);
+    std::vector<std::thread> threads;
 
-            // No items are available. This could be due to being fully done.
+    for (size_t i = 0; i < num_threads; i++) {
+        threads.emplace_back([i, &file_queue, &strings_per_thread]() {
+            strings_per_thread[i] = get_samples(file_queue);
+        });
+    }
 
-            // Check if we are done
-            if (remaining_live_writers.load(std::memory_order_acquire) == 0) {
-                return;
-            }
+    for (auto& thread : threads) {
+        thread.join();
+    }
 
-            // Need to wait more
-        }
+    std::vector<std::string> dictionary_entries;
 
-        data.clear();
-        row_indices.clear();
+    absl::flat_hash_map<std::string, uint32_t> unique_entries;
+    uint32_t next_index = 0;
 
-        {
-            ZstdRowReader reader(filename, decompression_context.get());
-
-            while (true) {
-                auto next = reader.get_next();
-
-                if (!next) {
-                    break;
-                }
-
-                size_t start = data.size();
-                size_t length = std::get<2>(*next).size();
-
-                data.insert(std::end(data), std::begin(std::get<2>(*next)),
-                            std::end(std::get<2>(*next)));
-                row_indices.push_back(std::make_tuple(
-                    std::get<0>(*next), std::get<1>(*next), start, length));
-            }
-        }
-
-        pdqsort_branchless(
-            std::begin(row_indices), std::end(row_indices),
-            EventComparator<decltype(row_indices)::value_type>());
-
-        {
-            ZstdRowWriter writer(filename, compression_context.get());
-
-            for (const auto& row_index : row_indices) {
-                writer.add_next(
-                    std::string_view(data.data() + std::get<2>(row_index),
-                                     std::get<3>(row_index)));
+    for (auto& entry : strings_per_thread) {
+        for (auto& s : entry) {
+            auto e = unique_entries.try_emplace(s, next_index);
+            if (e.second) {
+                next_index++;
+                dictionary_entries.emplace_back(std::move(s));
             }
         }
     }
+
+    return {unique_entries, dictionary_entries};
 }
 
-constexpr int QUEUE_SIZE = 10000;
-
-std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>
+std::pair<std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>,
+          std::vector<std::string>>
 sort_and_shard(const std::filesystem::path& source_directory,
-               const std::filesystem::path& target_directory,
-               size_t num_shards) {
+               const std::filesystem::path& target_directory, size_t num_shards,
+               size_t num_threads) {
+    auto dictionary_and_entries =
+        compute_string_dictionary(source_directory, num_threads);
+    const absl::flat_hash_map<std::string, uint32_t>& string_dictionary =
+        dictionary_and_entries.first;
+
     std::filesystem::create_directory(target_directory);
 
     std::vector<std::string> paths;
@@ -861,7 +697,7 @@ sort_and_shard(const std::filesystem::path& source_directory,
     }
 
     auto set_properties_fields =
-        get_properties_fields_multithreaded(paths, num_shards);
+        get_properties_fields_multithreaded(paths, num_threads);
 
     std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>
         properties_columns(std::begin(set_properties_fields),
@@ -887,11 +723,45 @@ sort_and_shard(const std::filesystem::path& source_directory,
         }
     }
 
-    if (properties_columns.size() + 3 >
-        std::numeric_limits<unsigned long long>::digits) {
+    auto add_and_force = [&](const std::string& name,
+                             std::shared_ptr<arrow::DataType> type,
+                             bool add_back = true) {
+        auto code_iter = std::find_if(
+            std::begin(properties_columns), std::end(properties_columns),
+            [&name](const auto& entry) { return entry.first == name; });
+
+        if (code_iter != std::end(properties_columns)) {
+            if (type->Equals(arrow::StringType()) &&
+                code_iter->second->Equals(arrow::LargeStringType())) {
+                // Hack to work around this
+                type = std::make_shared<arrow::LargeStringType>();
+            }
+
+            if (!code_iter->second->Equals(type)) {
+                throw std::runtime_error("For column " + name +
+                                         " got unexpected type " +
+                                         code_iter->second->ToString());
+            }
+            properties_columns.erase(code_iter);
+        }
+
+        if (add_back) {
+            properties_columns.insert(std::begin(properties_columns),
+                                      std::make_pair(name, type));
+        }
+    };
+
+    add_and_force("numeric_value", std::make_shared<arrow::FloatType>());
+    add_and_force("code", std::make_shared<arrow::StringType>());
+    add_and_force(
+        "time", std::make_shared<arrow::TimestampType>(arrow::TimeUnit::MICRO),
+        false);
+    add_and_force("patient_id", std::make_shared<arrow::Int64Type>(), false);
+
+    if (properties_columns.size() > std::numeric_limits<uint64_t>::digits) {
         throw std::runtime_error(
             "C++ MEDS-ETL currently only supports at most " +
-            std::to_string(std::numeric_limits<unsigned long long>::digits) +
+            std::to_string(std::numeric_limits<uint64_t>::digits) +
             " properties columns");
     }
 
@@ -901,117 +771,164 @@ sort_and_shard(const std::filesystem::path& source_directory,
         file_queue.enqueue(path);
     }
 
-    for (size_t i = 0; i < num_shards; i++) {
+    for (size_t i = 0; i < num_threads; i++) {
         file_queue.enqueue({});
     }
 
     std::vector<moodycamel::BlockingConcurrentQueue<QueueItem>> write_queues(
-        num_shards);
+        num_threads);
 
     std::vector<std::thread> threads;
 
-    moodycamel::LightweightSemaphore write_semaphore(QUEUE_SIZE * num_shards);
+    moodycamel::LightweightSemaphore write_semaphore(QUEUE_SIZE * num_threads);
 
-    moodycamel::BlockingConcurrentQueue<std::string> sort_queue;
-    std::atomic<ssize_t> remaining_live_writers(num_shards);
-
-    for (size_t i = 0; i < num_shards; i++) {
+    for (size_t i = 0; i < num_threads; i++) {
         threads.emplace_back([i, &file_queue, &write_queues, &write_semaphore,
-                              num_shards, &properties_columns]() {
-            shard_reader(i, num_shards, file_queue, write_queues,
-                         write_semaphore, properties_columns);
+                              num_shards, num_threads, &properties_columns,
+                              &string_dictionary]() {
+            shard_reader(i, num_shards, num_threads, file_queue, write_queues,
+                         write_semaphore, properties_columns,
+                         string_dictionary);
         });
 
         threads.emplace_back([i, &write_queues, &write_semaphore, num_shards,
-                              target_directory, &sort_queue,
-                              &remaining_live_writers]() {
-            shard_writer(i, num_shards, write_queues[i], write_semaphore,
-                         target_directory / std::to_string(i), sort_queue,
-                         remaining_live_writers);
+                              num_threads, target_directory]() {
+            shard_writer(i, num_shards, num_threads, write_queues[i],
+                         write_semaphore, target_directory);
         });
-
-        if (i % 2 == 0) {
-            threads.emplace_back([&sort_queue, &remaining_live_writers]() {
-                shard_sort(sort_queue, remaining_live_writers);
-            });
-        }
     }
 
     for (auto& thread : threads) {
         thread.join();
     }
 
-    absl::optional<std::string> next_entry;
-    if (sort_queue.try_dequeue(next_entry)) {
-        // This should not be possible
-        throw std::runtime_error(
-            "Had excess unsorted items. This should not be possible");
-    }
-
-    return properties_columns;
+    return {properties_columns, dictionary_and_entries.second};
 }
 
 void join_and_write_single(
-    const std::filesystem::path& source_directory,
+    const std::filesystem::path& source_path,
     const std::filesystem::path& target_path,
     const std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>&
-        properties_columns) {
-    arrow::FieldVector properties_fields;
-    std::bitset<std::numeric_limits<unsigned long long>::digits>
-        is_text_properties;
+        properties_columns,
+    const std::vector<std::string>& dictionary_entries) {
+    MmapFile data(source_path);
+    if (data.bytes().size() == 0) {
+        return;
+    }
+
+    arrow::MemoryPool* pool = arrow::default_memory_pool();
+
+    auto timestamp_type =
+        std::make_shared<arrow::TimestampType>(arrow::TimeUnit::MICRO);
+
+    arrow::FieldVector properties_fields = {
+        arrow::field("patient_id", std::make_shared<arrow::Int64Type>()),
+        arrow::field("time", timestamp_type),
+    };
+
+    auto patient_id_builder = std::make_shared<arrow::Int64Builder>(pool);
+    auto time_builder =
+        std::make_shared<arrow::TimestampBuilder>(timestamp_type, pool);
+
+    std::vector<std::shared_ptr<arrow::ArrayBuilder>> builders = {
+        patient_id_builder, time_builder};
+
+    std::vector<std::function<const char*(const char*)>> writers;
+
     for (size_t i = 0; i < properties_columns.size(); i++) {
         const auto& properties_column = properties_columns[i];
-        if (properties_column.second->Equals(arrow::LargeStringType())) {
-            is_text_properties[i] = true;
+        if (properties_column.second->Equals(arrow::StringType()) ||
+            properties_column.first == "code") {
+            auto string_builder = std::make_shared<arrow::StringBuilder>(pool);
+
+            auto writer = [string_builder, &dictionary_entries](
+                              const char* data) -> const char* {
+                if (data == nullptr) {
+                    PARQUET_THROW_NOT_OK(string_builder->AppendNull());
+                    return nullptr;
+                } else {
+                    uint32_t size = *(uint32_t*)data;
+                    if ((size & DICTIONARY_MASK) == 0) {
+                        PARQUET_THROW_NOT_OK(
+                            string_builder->Append(dictionary_entries[size]));
+                        return data + sizeof(uint32_t);
+                    } else {
+                        PARQUET_THROW_NOT_OK(string_builder->Append(
+                            std::string_view(data + sizeof(uint32_t),
+                                             size & ~DICTIONARY_MASK)));
+                        return data + sizeof(uint32_t) +
+                               (size & ~DICTIONARY_MASK);
+                    }
+                }
+            };
+
+            writers.emplace_back(std::move(writer));
+            builders.emplace_back(std::move(string_builder));
+        } else if (properties_column.second->Equals(arrow::LargeStringType())) {
+            auto string_builder =
+                std::make_shared<arrow::LargeStringBuilder>(pool);
+
+            auto writer = [string_builder, &dictionary_entries](
+                              const char* data) -> const char* {
+                if (data == nullptr) {
+                    PARQUET_THROW_NOT_OK(string_builder->AppendNull());
+                    return nullptr;
+                } else {
+                    uint32_t size = *(uint32_t*)data;
+                    if ((size & DICTIONARY_MASK) == 0) {
+                        PARQUET_THROW_NOT_OK(
+                            string_builder->Append(dictionary_entries[size]));
+                        return data + sizeof(uint32_t);
+                    } else {
+                        PARQUET_THROW_NOT_OK(string_builder->Append(
+                            std::string_view(data + sizeof(uint32_t),
+                                             size & ~DICTIONARY_MASK)));
+                        return data + sizeof(uint32_t) +
+                               (size & ~DICTIONARY_MASK);
+                    }
+                }
+            };
+
+            writers.emplace_back(std::move(writer));
+            builders.emplace_back(std::move(string_builder));
+        } else {
+            auto primitive_builder =
+                std::make_shared<arrow::FixedSizeBinaryBuilder>(
+                    std::make_shared<arrow::FixedSizeBinaryType>(
+                        properties_column.second->byte_width()));
+            int num_bytes = properties_column.second->byte_width();
+            auto writer = [primitive_builder,
+                           num_bytes](const char* data) -> const char* {
+                if (data == nullptr) {
+                    PARQUET_THROW_NOT_OK(primitive_builder->AppendNull());
+                    return nullptr;
+                } else {
+                    PARQUET_THROW_NOT_OK(primitive_builder->Append(data));
+                    return data + num_bytes;
+                }
+            };
+
+            writers.emplace_back(std::move(writer));
+            builders.emplace_back(std::move(primitive_builder));
+        }
+
+        if (properties_column.first == "code") {
             properties_fields.push_back(
                 arrow::field(properties_column.first,
                              std::make_shared<arrow::StringType>()));
+
         } else {
-            is_text_properties[i] = false;
             properties_fields.push_back(arrow::field(properties_column.first,
                                                      properties_column.second));
         }
     }
 
-    std::shared_ptr<arrow::DataType> properties_type;
-    if (properties_columns.size() != 0) {
-        properties_type =
-            std::make_shared<arrow::StructType>(properties_fields);
-    } else {
-        properties_type = std::make_shared<arrow::FloatType>();
-    }
-
-    auto timestamp_type =
-        std::make_shared<arrow::TimestampType>(arrow::TimeUnit::MICRO);
-
-    auto event_type_fields = {
-        arrow::field("time", std::make_shared<arrow::TimestampType>(
-                                 arrow::TimeUnit::MICRO)),
-
-        arrow::field("code", std::make_shared<arrow::StringType>()),
-
-        arrow::field("text_value", std::make_shared<arrow::StringType>()),
-        arrow::field("numeric_value", std::make_shared<arrow::FloatType>()),
-        arrow::field("datetime_value", std::make_shared<arrow::TimestampType>(
-                                           arrow::TimeUnit::MICRO)),
-
-        arrow::field("properties", properties_type),
-    };
-    auto event_type = std::make_shared<arrow::StructType>(event_type_fields);
-    auto events_type = std::make_shared<arrow::ListType>(event_type);
-
-    auto schema_fields = {
-        arrow::field("patient_id", std::make_shared<arrow::Int64Type>()),
-        arrow::field("events", events_type),
-    };
-    auto schema = std::make_shared<arrow::Schema>(schema_fields);
+    auto schema = std::make_shared<arrow::Schema>(properties_fields);
 
     using parquet::ArrowWriterProperties;
     using parquet::WriterProperties;
 
     size_t amount_written = 0;
-
-    arrow::MemoryPool* pool = arrow::default_memory_pool();
 
     // Choose compression
     std::shared_ptr<WriterProperties> props =
@@ -1032,99 +949,13 @@ void join_and_write_single(
         writer, parquet::arrow::FileWriter::Open(*schema, pool, outfile, props,
                                                  arrow_props));
 
-    std::vector<ZstdRowReader> source_files;
-
-    auto context_deleter = [](ZSTD_DCtx* context) { ZSTD_freeDCtx(context); };
-
-    std::unique_ptr<ZSTD_DCtx, decltype(context_deleter)> context{
-        ZSTD_createDCtx(), context_deleter};
-
-    for (const auto& entry : fs::directory_iterator(source_directory)) {
-        source_files.emplace_back(entry.path(), context.get());
-    }
-
-    typedef std::tuple<int64_t, int64_t, size_t, std::string_view>
-        PriorityQueueItem;
-
-    std::priority_queue<PriorityQueueItem, std::vector<PriorityQueueItem>,
-                        EventComparator<PriorityQueueItem, true>>
-        queue;
-
-    for (size_t i = 0; i < source_files.size(); i++) {
-        auto next_entry = source_files[i].get_next();
-        if (!next_entry) {
-            continue;
-        }
-
-        queue.push(std::make_tuple(std::get<0>(*next_entry),
-                                   std::get<1>(*next_entry), i,
-                                   std::get<2>(*next_entry)));
-    }
-
-    auto patient_id_builder = std::make_shared<arrow::Int64Builder>(pool);
-
-    auto code_builder = std::make_shared<arrow::StringBuilder>(pool);
-
-    auto text_value_builder = std::make_shared<arrow::StringBuilder>(pool);
-    auto numeric_value_builder = std::make_shared<arrow::FloatBuilder>(pool);
-    auto datetime_value_builder =
-        std::make_shared<arrow::TimestampBuilder>(timestamp_type, pool);
-
-    std::vector<std::shared_ptr<arrow::StringBuilder>> text_properties_builders(
-        properties_columns.size());
-    std::vector<std::shared_ptr<arrow::FixedSizeBinaryBuilder>>
-        primitive_properties_builders(properties_columns.size());
-
-    std::shared_ptr<arrow::StructBuilder> properties_builder;
-    std::shared_ptr<arrow::FloatBuilder> null_properties_builder;
-    std::shared_ptr<arrow::ArrayBuilder> properties_builder_holder;
-
-    if (properties_columns.size() != 0) {
-        std::vector<std::shared_ptr<arrow::ArrayBuilder>> properties_builders(
-            properties_columns.size());
-        for (size_t i = 0; i < properties_columns.size(); i++) {
-            if (is_text_properties[i]) {
-                auto builder = std::make_shared<arrow::StringBuilder>(pool);
-                text_properties_builders[i] = builder;
-                properties_builders[i] = builder;
-            } else {
-                auto builder = std::make_shared<arrow::FixedSizeBinaryBuilder>(
-                    std::make_shared<arrow::FixedSizeBinaryType>(
-                        properties_columns[i].second->byte_width()));
-                primitive_properties_builders[i] = builder;
-                properties_builders[i] = builder;
-            }
-        }
-
-        properties_builder = std::make_shared<arrow::StructBuilder>(
-            properties_type, pool, properties_builders);
-        properties_builder_holder = properties_builder;
-    } else {
-        null_properties_builder = std::make_shared<arrow::FloatBuilder>(pool);
-        properties_builder_holder = null_properties_builder;
-    }
-
-    auto time_builder =
-        std::make_shared<arrow::TimestampBuilder>(timestamp_type, pool);
-
-    std::vector<std::shared_ptr<arrow::ArrayBuilder>> event_builder_fields{
-        time_builder,           code_builder,
-        text_value_builder,     numeric_value_builder,
-        datetime_value_builder, properties_builder_holder};
-
-    auto event_builder = std::make_shared<arrow::StructBuilder>(
-        event_type, pool, event_builder_fields);
-
-    auto events_builder =
-        std::make_shared<arrow::ListBuilder>(pool, event_builder);
-
     auto flush_arrays = [&]() {
-        std::vector<std::shared_ptr<arrow::Array>> columns(2);
-        PARQUET_THROW_NOT_OK(patient_id_builder->Finish(columns.data() + 0));
-
-        std::shared_ptr<arrow::Array> events_array;
-        PARQUET_THROW_NOT_OK(events_builder->Finish(&events_array));
-        PARQUET_ASSIGN_OR_THROW(columns[1], events_array->View(events_type));
+        std::vector<std::shared_ptr<arrow::Array>> columns(builders.size());
+        for (size_t i = 0; i < builders.size(); i++) {
+            PARQUET_THROW_NOT_OK(builders[i]->Finish(columns.data() + i));
+            PARQUET_ASSIGN_OR_THROW(
+                columns[i], columns[i]->View(properties_fields[i]->type()));
+        }
 
         std::shared_ptr<arrow::Table> table =
             arrow::Table::Make(schema, columns);
@@ -1134,117 +965,59 @@ void join_and_write_single(
         amount_written = 0;
     };
 
-    bool is_first = true;
-    int64_t last_patient_id = -1;
+    std::vector<std::tuple<int64_t, int64_t, std::string_view>> events;
 
-    while (!queue.empty()) {
-        auto next = std::move(queue.top());
-        queue.pop();
+    const char* pointer = data.bytes().begin();
 
-        int64_t patient_id = std::get<0>(next);
-        int64_t time = std::get<1>(next);
-        std::string_view patient_record = std::get<3>(next);
-        amount_written += patient_record.size();
+    while (pointer != data.bytes().end()) {
+        int64_t* header = (int64_t*)pointer;
+        int64_t size = header[0];
+        int64_t patient_id = header[1];
+        int64_t time = header[2];
 
-        if (patient_id != last_patient_id || is_first) {
-            is_first = false;
+        pointer += sizeof(int64_t);
 
-            if (amount_written > PARQUET_PIECE_SIZE) {
-                flush_arrays();
-            }
+        events.push_back(std::make_tuple(
+            patient_id, time,
+            std::string_view(pointer + sizeof(int64_t) * 2, size)));
 
-            last_patient_id = patient_id;
+        pointer += size;
+    }
 
-            PARQUET_THROW_NOT_OK(patient_id_builder->Append(patient_id));
-            PARQUET_THROW_NOT_OK(events_builder->Append());
+    pdqsort_branchless(std::begin(events), std::end(events));
+
+    for (const auto& event : events) {
+        int64_t patient_id = std::get<0>(event);
+        int64_t time = std::get<1>(event);
+        std::string_view patient_record = std::get<2>(event);
+
+        amount_written++;
+
+        if (amount_written > PARQUET_PIECE_SIZE) {
+            flush_arrays();
         }
 
-        PARQUET_THROW_NOT_OK(event_builder->Append());
-        PARQUET_THROW_NOT_OK(time_builder->Append(time));
-
-        std::bitset<std::numeric_limits<unsigned long long>::digits> non_null(
-            *reinterpret_cast<const unsigned long long*>(
-                patient_record.data() + patient_record.size() -
-                sizeof(unsigned long long)));
-        size_t offset = sizeof(int64_t) * 2;
-
-        size_t size = *reinterpret_cast<const size_t*>(
-            patient_record.substr(offset).data());
-        offset += sizeof(size);
-        PARQUET_THROW_NOT_OK(
-            code_builder->Append(patient_record.substr(offset, size)));
-        offset += size;
-
-        if (non_null[0]) {
-            PARQUET_THROW_NOT_OK(
-                numeric_value_builder->Append(*reinterpret_cast<const float*>(
-                    patient_record.substr(offset).data())));
-            offset += sizeof(float);
+        PARQUET_THROW_NOT_OK(patient_id_builder->Append(patient_id));
+        if (time == std::numeric_limits<int64_t>::min()) {
+            PARQUET_THROW_NOT_OK(time_builder->AppendNull());
         } else {
-            PARQUET_THROW_NOT_OK(numeric_value_builder->AppendNull());
+            PARQUET_THROW_NOT_OK(time_builder->Append(time));
         }
 
-        if (non_null[1]) {
-            PARQUET_THROW_NOT_OK(datetime_value_builder->Append(
-                *reinterpret_cast<const int64_t*>(
-                    patient_record.substr(offset).data())));
-            offset += sizeof(int64_t);
-        } else {
-            PARQUET_THROW_NOT_OK(datetime_value_builder->AppendNull());
-        }
+        const char* data = patient_record.data();
 
-        if (non_null[2]) {
-            size_t size = *reinterpret_cast<const size_t*>(
-                patient_record.substr(offset).data());
-            offset += sizeof(size);
-            PARQUET_THROW_NOT_OK(text_value_builder->Append(
-                patient_record.substr(offset, size)));
-            offset += size;
-        } else {
-            PARQUET_THROW_NOT_OK(text_value_builder->AppendNull());
-        }
+        uint64_t* null_byte_pointer = (uint64_t*)data;
+        std::bitset<64> is_valid(*null_byte_pointer);
 
-        if (properties_columns.size() == 0) {
-            PARQUET_THROW_NOT_OK(null_properties_builder->AppendNull());
-        } else {
-            PARQUET_THROW_NOT_OK(properties_builder->Append());
+        data += sizeof(uint64_t);
 
-            for (size_t j = 0; j < properties_columns.size(); j++) {
-                if (non_null[3 + j]) {
-                    size_t size = *reinterpret_cast<const size_t*>(
-                        patient_record.substr(offset).data());
-                    offset += sizeof(size);
-                    auto entry = patient_record.substr(offset, size);
-
-                    if (is_text_properties[j]) {
-                        PARQUET_THROW_NOT_OK(
-                            text_properties_builders[j]->Append(entry));
-                    } else {
-                        PARQUET_THROW_NOT_OK(
-                            primitive_properties_builders[j]->Append(entry));
-                    }
-                    offset += size;
-                } else {
-                    if (is_text_properties[j]) {
-                        PARQUET_THROW_NOT_OK(
-                            text_properties_builders[j]->AppendNull());
-                    } else {
-                        PARQUET_THROW_NOT_OK(
-                            primitive_properties_builders[j]->AppendNull());
-                    }
-                }
+        for (size_t i = 0; i < writers.size(); i++) {
+            if (is_valid.test(i)) {
+                data = writers[i](data);
+            } else {
+                writers[i](nullptr);
             }
         }
-
-        size_t file_index = std::get<2>(next);
-        auto next_entry = source_files[file_index].get_next();
-        if (!next_entry) {
-            continue;
-        }
-
-        queue.push(std::make_tuple(std::get<0>(*next_entry),
-                                   std::get<1>(*next_entry), file_index,
-                                   std::get<2>(*next_entry)));
     }
 
     flush_arrays();
@@ -1257,23 +1030,34 @@ void join_and_write(
     const std::filesystem::path& source_directory,
     const std::filesystem::path& target_directory,
     const std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>>&
-        properties_columns) {
+        properties_columns,
+    const std::vector<std::string>& dictionary_entries, size_t num_threads) {
     std::filesystem::create_directory(target_directory);
 
-    std::vector<std::string> shards;
+    moodycamel::BlockingConcurrentQueue<absl::optional<std::string>> file_queue;
 
     for (const auto& entry : fs::directory_iterator(source_directory)) {
-        shards.push_back(fs::relative(entry.path(), source_directory));
+        file_queue.enqueue(fs::relative(entry.path(), source_directory));
     }
 
     std::vector<std::thread> threads;
 
-    for (const auto& shard : shards) {
-        threads.emplace_back([shard, &source_directory, &target_directory,
-                              &properties_columns]() {
-            join_and_write_single(source_directory / shard,
-                                  target_directory / (shard + ".parquet"),
-                                  properties_columns);
+    for (size_t i = 0; i < num_threads; i++) {
+        file_queue.enqueue({});
+        threads.emplace_back([&file_queue, &source_directory, &target_directory,
+                              &properties_columns, &dictionary_entries]() {
+            absl::optional<std::string> item;
+            while (true) {
+                file_queue.wait_dequeue(item);
+
+                if (!item) {
+                    break;
+                }
+
+                join_and_write_single(source_directory / *item,
+                                      target_directory / (*item + ".parquet"),
+                                      properties_columns, dictionary_entries);
+            }
         });
     }
 
@@ -1282,24 +1066,29 @@ void join_and_write(
     }
 }
 
+}  // namespace
+
 void perform_etl(const std::string& source_directory,
-                 const std::string& target_directory, size_t num_shards) {
+                 const std::string& target_directory, size_t num_shards,
+                 size_t num_threads) {
     std::filesystem::path source_path(source_directory);
     std::filesystem::path target_path(target_directory);
 
     std::filesystem::create_directory(target_path);
 
-    if (fs::exists(source_path / "metadata.json")) {
-        fs::copy_file(source_path / "metadata.json",
-                      target_path / "metadata.json");
+    if (fs::exists(source_path / "metadata")) {
+        fs::copy(source_path / "metadata", target_path / "metadata");
     }
 
     std::filesystem::path shard_path = target_path / "shards";
     std::filesystem::path data_path = target_path / "data";
 
-    auto properties_columns =
-        sort_and_shard(source_path / "flat_data", shard_path, num_shards);
-    join_and_write(shard_path, data_path, properties_columns);
+    auto properties_columns_and_dictionary = sort_and_shard(
+        source_path / "unsorted_data", shard_path, num_shards, num_threads);
+
+    join_and_write(shard_path, data_path,
+                   properties_columns_and_dictionary.first,
+                   properties_columns_and_dictionary.second, num_threads);
 
     fs::remove_all(shard_path);
 }

@@ -4,10 +4,8 @@ int main() {
     size_t num_shards = 2;
 
     std::string path_to_folder =
-        "/labs/shahlab/projects/ethanid/mimic_test/mimic_demo/temp";
-    std::string output =
-        "/labs/shahlab/projects/ethanid/optimize_etl/meds_etl_cpp/native/"
-        "output";
+        "/home/ethanid/health_research/mimic-iv-demo-meds9/temp";
+    std::string output = "/home/ethanid/health_research/mimic-iv-demo-meds9/ok";
 
-    perform_etl(path_to_folder, output, num_shards);
+    perform_etl(path_to_folder, output, 100, 6);
 }

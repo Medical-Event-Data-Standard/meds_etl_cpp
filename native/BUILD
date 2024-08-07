@@ -11,14 +11,15 @@ cc_binary(
 
 cc_library(
     name="perform_etl",
-    srcs=["perform_etl.cc", "pdqsort.h"],
+    srcs=["perform_etl.cc", "pdqsort.h", "mmap_file.hh"],
     hdrs=["perform_etl.hh"],
     deps=[
         ":arrow", 
         "@com_google_absl//absl/types:optional",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@readerwriterqueue",
         "@concurrentqueue",
-        ":zstd",
     ],
 )
 
@@ -62,16 +63,4 @@ cmake(
     lib_source = "@arrow//:all",
     out_static_libs = ["libparquet.a", "libarrow.a", "libarrow_bundled_dependencies.a"],
     linkopts = ["-pthread"],
-)
-
-cmake(
-    name = "zstd",
-    cache_entries = {
-        "CMAKE_C_FLAGS": "-fPIC",
-        "CMAKE_CXX_FLAGS": "-fPIC",
-        "CMAKE_INSTALL_LIBDIR": "lib",
-    },
-    working_directory="build/cmake",
-    lib_source = "@zstd//:all",
-    out_static_libs = ["libzstd.a"],
 )
