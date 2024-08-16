@@ -74,7 +74,7 @@ std::vector<std::shared_ptr<::arrow::Field>> get_fields_for_file(
     return fields;
 }
 
-const std::vector<std::string> known_fields = {"patient_id", "time"};
+const std::vector<std::string> known_fields = {"subject_id", "time"};
 
 std::set<std::pair<std::string, std::shared_ptr<arrow::DataType>>>
 get_properties_fields(const std::vector<std::string>& files) {
@@ -465,8 +465,8 @@ void shard_reader(
                 PARQUET_THROW_NOT_OK(
                     arrow_reader->ReadRowGroup(row_group, &table));
 
-                NumericRowIterator<arrow::Int64Array> patient_id_column(
-                    table->GetColumnByName("patient_id"));
+                NumericRowIterator<arrow::Int64Array> subject_id_column(
+                    table->GetColumnByName("subject_id"));
                 NumericRowIterator<arrow::TimestampArray> time_column(
                     table->GetColumnByName("time"));
 
@@ -511,13 +511,13 @@ void shard_reader(
                     }
                 }
 
-                while (patient_id_column.has_next()) {
-                    auto possible_patient_id = patient_id_column.get_next();
-                    if (!possible_patient_id) {
-                        throw std::runtime_error("Missing a patient id value");
+                while (subject_id_column.has_next()) {
+                    auto possible_subject_id = subject_id_column.get_next();
+                    if (!possible_subject_id) {
+                        throw std::runtime_error("Missing a subject id value");
                     }
 
-                    int64_t patient_id = *possible_patient_id;
+                    int64_t subject_id = *possible_subject_id;
                     std::optional<int64_t> possible_time =
                         time_column.get_next();
 
@@ -531,7 +531,7 @@ void shard_reader(
 
                     {
                         int64_t* id_map = (int64_t*)(result.data());
-                        id_map[0] = patient_id;
+                        id_map[0] = subject_id;
                         id_map[1] = time;
                     }
 
@@ -550,7 +550,7 @@ void shard_reader(
                     *null_map = is_valid.to_ulong();
 
                     size_t index =
-                        std::hash<int64_t>()(patient_id) % num_shards;
+                        std::hash<int64_t>()(subject_id) % num_shards;
                     size_t thread_index = index % num_threads;
 
                     all_write_queues[thread_index].enqueue(ptoks[thread_index],
@@ -614,10 +614,10 @@ void shard_writer(size_t writer_index, size_t num_shards, size_t num_threads,
         }
 
         std::vector<char>& r = *item;
-        int64_t* patient_id_ptr = (int64_t*)r.data();
-        int64_t patient_id = *patient_id_ptr;
+        int64_t* subject_id_ptr = (int64_t*)r.data();
+        int64_t subject_id = *subject_id_ptr;
 
-        size_t shard = std::hash<int64_t>()(patient_id) % num_shards;
+        size_t shard = std::hash<int64_t>()(subject_id) % num_shards;
         size_t index = shard / num_threads;
         int64_t size = r.size();
         subshards[index].write((const char*)&size, sizeof(size));
@@ -755,7 +755,7 @@ sort_and_shard(const std::filesystem::path& source_directory,
     add_and_force(
         "time", std::make_shared<arrow::TimestampType>(arrow::TimeUnit::MICRO),
         false);
-    add_and_force("patient_id", std::make_shared<arrow::Int64Type>(), false);
+    add_and_force("subject_id", std::make_shared<arrow::Int64Type>(), false);
 
     if (properties_columns.size() > std::numeric_limits<uint64_t>::digits) {
         throw std::runtime_error(
@@ -821,16 +821,16 @@ void join_and_write_single(
         std::make_shared<arrow::TimestampType>(arrow::TimeUnit::MICRO);
 
     arrow::FieldVector properties_fields = {
-        arrow::field("patient_id", std::make_shared<arrow::Int64Type>()),
+        arrow::field("subject_id", std::make_shared<arrow::Int64Type>()),
         arrow::field("time", timestamp_type),
     };
 
-    auto patient_id_builder = std::make_shared<arrow::Int64Builder>(pool);
+    auto subject_id_builder = std::make_shared<arrow::Int64Builder>(pool);
     auto time_builder =
         std::make_shared<arrow::TimestampBuilder>(timestamp_type, pool);
 
     std::vector<std::shared_ptr<arrow::ArrayBuilder>> builders = {
-        patient_id_builder, time_builder};
+        subject_id_builder, time_builder};
 
     std::vector<std::function<const char*(const char*)>> writers;
 
@@ -971,13 +971,13 @@ void join_and_write_single(
     while (pointer != data.bytes().end()) {
         int64_t* header = (int64_t*)pointer;
         int64_t size = header[0];
-        int64_t patient_id = header[1];
+        int64_t subject_id = header[1];
         int64_t time = header[2];
 
         pointer += sizeof(int64_t);
 
         events.push_back(std::make_tuple(
-            patient_id, time,
+            subject_id, time,
             std::string_view(pointer + sizeof(int64_t) * 2, size)));
 
         pointer += size;
@@ -986,9 +986,9 @@ void join_and_write_single(
     pdqsort_branchless(std::begin(events), std::end(events));
 
     for (const auto& event : events) {
-        int64_t patient_id = std::get<0>(event);
+        int64_t subject_id = std::get<0>(event);
         int64_t time = std::get<1>(event);
-        std::string_view patient_record = std::get<2>(event);
+        std::string_view subject_record = std::get<2>(event);
 
         amount_written++;
 
@@ -996,14 +996,14 @@ void join_and_write_single(
             flush_arrays();
         }
 
-        PARQUET_THROW_NOT_OK(patient_id_builder->Append(patient_id));
+        PARQUET_THROW_NOT_OK(subject_id_builder->Append(subject_id));
         if (time == std::numeric_limits<int64_t>::min()) {
             PARQUET_THROW_NOT_OK(time_builder->AppendNull());
         } else {
             PARQUET_THROW_NOT_OK(time_builder->Append(time));
         }
 
-        const char* data = patient_record.data();
+        const char* data = subject_record.data();
 
         uint64_t* null_byte_pointer = (uint64_t*)data;
         std::bitset<64> is_valid(*null_byte_pointer);
