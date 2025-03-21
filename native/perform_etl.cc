@@ -286,18 +286,20 @@ struct ChunkedArrayIterator {
         if (!current_chunk) {
             throw std::runtime_error("Could not cast time array");
         }
+
         array_index = 0;
+
+        update_chunk();
     }
 
-    bool has_next() { return chunk_index < array->num_chunks(); }
+    bool has_next() { return current_chunk != nullptr; }
 
     const std::shared_ptr<C>& current_array() { return current_chunk; }
 
     int64_t current_index() { return array_index; }
 
-    void increment() {
-        array_index++;
-        if (array_index == current_chunk->length()) {
+    void update_chunk() {
+        while ((current_chunk != nullptr) && (array_index == current_chunk->length())) {
             chunk_index++;
             if (chunk_index < array->num_chunks()) {
                 current_chunk =
@@ -306,10 +308,17 @@ struct ChunkedArrayIterator {
                 if (!current_chunk) {
                     throw std::runtime_error("Could not cast time array");
                 }
+            } else {
+                current_chunk = nullptr;
             }
 
             array_index = 0;
         }
+    }
+
+    void increment() {
+        array_index++;
+        update_chunk();
     }
 
     std::shared_ptr<arrow::ChunkedArray> array;
