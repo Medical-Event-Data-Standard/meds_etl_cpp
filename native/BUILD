@@ -15,9 +15,9 @@ cc_library(
     hdrs=["perform_etl.hh"],
     deps=[
         ":arrow", 
-        "@com_google_absl//absl/types:optional",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/types:optional",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/container:flat_hash_set",
         "@readerwriterqueue",
         "@concurrentqueue",
     ],
