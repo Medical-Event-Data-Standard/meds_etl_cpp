@@ -3,3 +3,6 @@ dist
 native/bazel-*
 *.so
 *egg-info
+wheelhouse
+build
+MODULE.bazel.lock
