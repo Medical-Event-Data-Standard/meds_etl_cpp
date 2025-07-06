@@ -985,9 +985,11 @@ void join_and_write_single(
 
         pointer += sizeof(int64_t);
 
+        size_t subject_and_time_size = sizeof(int64_t) * 2;
+
         events.push_back(std::make_tuple(
             subject_id, time,
-            std::string_view(pointer + sizeof(int64_t) * 2, size)));
+            std::string_view(pointer + subject_and_time_size, size - subject_and_time_size)));
 
         pointer += size;
     }
