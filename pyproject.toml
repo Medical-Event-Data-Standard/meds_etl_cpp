@@ -21,10 +21,10 @@ namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 [tool.cibuildwheel]
 skip = ["*-musllinux_* pp*"]
 archs = ["auto64"]
+before-build = "git restore native/MODULE.bazel.lock"
 
 [tool.cibuildwheel.linux]
 before-all = "bash build/linux_setup.sh"
-before-build = "git status"
 
 [tool.cibuildwheel.macos]
 environment = { MACOSX_DEPLOYMENT_TARGET="12" }
