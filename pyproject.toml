@@ -23,7 +23,8 @@ skip = ["*-musllinux_* pp*"]
 archs = ["auto64"]
 
 [tool.cibuildwheel.linux]
-before-all = "git status & bash build/linux_setup.sh"
+before-all = "bash build/linux_setup.sh"
+before-build = "git status"
 
 [tool.cibuildwheel.macos]
 environment = { MACOSX_DEPLOYMENT_TARGET="12" }
