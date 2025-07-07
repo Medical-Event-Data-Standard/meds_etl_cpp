@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Optimized algorithms for meds_etl implemented in C++."
 readme = "README.md"
 requires-python=">3.9"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 
 [tool.setuptools_scm]
 
