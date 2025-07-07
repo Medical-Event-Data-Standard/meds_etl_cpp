@@ -17,3 +17,20 @@ where = ["."]  # list of folders that contain the packages (["."] by default)
 include = ["meds_etl_cpp"]  # package names should match these glob patterns (["*"] by default)
 exclude = []  # exclude packages matching these glob patterns (empty by default)
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
+
+[tool.cibuildwheel]
+skip = ["*-musllinux_* pp*"]
+archs = ["auto64"]
+test-command = [
+  "pip install \"numpy<2\"",
+  "pytest {package}/tests",
+  "pip install \"numpy>2\"",
+  "pytest {package}/tests",
+]
+test-requires = "pytest"
+
+[tool.cibuildwheel.linux]
+before-all = "bash build/linux_setup.sh"
+
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET="12" }
