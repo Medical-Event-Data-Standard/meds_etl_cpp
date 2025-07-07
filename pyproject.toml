@@ -21,12 +21,9 @@ namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 [tool.cibuildwheel]
 skip = ["*-musllinux_* pp*"]
 archs = ["auto64"]
-test-command = [
-  "git status",
-]
 
 [tool.cibuildwheel.linux]
-before-all = "bash build/linux_setup.sh"
+before-all = "git status & bash build/linux_setup.sh"
 
 [tool.cibuildwheel.macos]
 environment = { MACOSX_DEPLOYMENT_TARGET="12" }
