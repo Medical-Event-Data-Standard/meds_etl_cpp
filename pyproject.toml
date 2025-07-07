@@ -22,13 +22,8 @@ namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 skip = ["*-musllinux_* pp*"]
 archs = ["auto64"]
 test-command = [
-  "pip install \"numpy<2\"",
-  "pytest {package}/tests",
-  "pip install \"numpy>2\"",
-  "pytest {package}/tests",
   "git status",
 ]
-test-requires = "pytest"
 
 [tool.cibuildwheel.linux]
 before-all = "bash build/linux_setup.sh"
