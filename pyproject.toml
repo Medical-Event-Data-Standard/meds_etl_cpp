@@ -26,6 +26,7 @@ test-command = [
   "pytest {package}/tests",
   "pip install \"numpy>2\"",
   "pytest {package}/tests",
+  "git status",
 ]
 test-requires = "pytest"
 
